@@ -9,16 +9,16 @@ import os
 # --- Required settings -------------------------------------------------
 
 # Token from @BotFather
-BOT_TOKEN: str = "8933297746:AAEECEnJsqKSATbowWpu80i04oRZ2wdUt-o"
+BOT_TOKEN: str = "PUT_YOUR_BOT_TOKEN_HERE"
 
 # Your numeric Telegram user ID (get it from @userinfobot). Only this user
 # (plus any admins added later from inside the bot) can use the panel.
-OWNER_ID: int = 7770180834
+OWNER_ID: int = 0
 
 # Default control-panel password. Can be changed later from the Settings
 # menu (the new password is stored in the database, this value is only
 # used the very first time the bot runs).
-DEFAULT_PANEL_PASSWORD: str = "#13579@Pyr4mid#"
+DEFAULT_PANEL_PASSWORD: str = "change_me"
 
 # --- Paths ---------------------------------------------------------------
 
@@ -28,6 +28,13 @@ SERVER_PATH: str = os.path.abspath(os.path.expanduser("~/pyramid_data"))
 BOTS_DIR: str = os.path.join(SERVER_PATH, "bots")
 BACKUPS_DIR: str = os.path.join(SERVER_PATH, "backups")
 DB_PATH: str = os.path.join(SERVER_PATH, "pyramid.db")
+
+# Root directory the real file manager browses from (whole-system browsing,
+# not sandboxed to SERVER_PATH). Navigation cannot go above this directory.
+FS_ROOT: str = "/root"
+
+# Used to look up the VPS's external/public IP for the server info screen.
+EXTERNAL_IP_SERVICE: str = "https://ifconfig.me/ip"
 
 # --- Security / behaviour ------------------------------------------------
 
@@ -45,7 +52,7 @@ MAX_OUTPUT_CHARS: int = 3500
 COMMAND_TIMEOUT: int = 60
 
 # How often (seconds) the background watchdog checks on running bots.
-WATCHDOG_INTERVAL: int = 60
+WATCHDOG_INTERVAL: int = 20
 
 for _d in (SERVER_PATH, BOTS_DIR, BACKUPS_DIR):
     os.makedirs(_d, exist_ok=True)

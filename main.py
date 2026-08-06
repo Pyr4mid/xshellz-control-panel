@@ -1,9 +1,11 @@
 """
 Pyramid Server Manager
 -----------------------
-A single-owner Telegram bot that acts as a lightweight control panel for a
-Linux VPS: bot process manager, file manager, terminal, resource monitor,
-backups and settings. Reply-keyboard only UI, SQLite storage.
+A single-owner Telegram bot that acts as a professional, fully button-driven
+control panel for a Linux VPS: bot process manager, real file manager,
+persistent terminal mode, live resource monitor, backups and settings.
+Reply-keyboard only UI (no typing paths/names unless unavoidable),
+SQLite storage.
 
 Run with:  python main.py
 """
@@ -14,15 +16,16 @@ import asyncio
 import logging
 import os
 import platform
-import shlex
 import shutil
 import signal
 import socket
 import sqlite3
 import subprocess
+import sys
 import time
+import urllib.request
 import zipfile
-from dataclasses import dataclass
+import importlib.metadata as importlib_metadata
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -47,42 +50,70 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("pyramid")
 
 # =========================================================================
-# Buttons / menu labels
+# Static button labels
 # =========================================================================
 
 BTN_BACK = "⬅️ رجوع"
-BTN_HOME = "🏠 الرئيسية"
+BTN_HOME = "🏠 القائمة الرئيسية"
+NAV_ROW = [BTN_BACK, BTN_HOME]
 
 BTN_BOTS = "🤖 إدارة البوتات"
 BTN_FILES = "📁 إدارة الملفات"
 BTN_SERVER_INFO = "🖥️ معلومات السيرفر"
-BTN_TERMINAL = "💻 الطرفية"
+BTN_TERMINAL = "💻 تريمنال"
 BTN_MONITOR = "📊 مراقبة الموارد"
 BTN_SETTINGS = "⚙️ الإعدادات"
 
-BTN_BOT_START = "▶️ تشغيل بوت"
-BTN_BOT_STOP = "⏹️ إيقاف بوت"
-BTN_BOT_RESTART = "🔄 إعادة تشغيل بوت"
-BTN_BOT_LOGS = "📄 عرض السجل"
-BTN_BOT_LIST = "📋 عرض جميع البوتات"
-BTN_BOT_UPLOAD = "⬆️ رفع بوت جديد"
-BTN_BOT_DELETE = "🗑️ حذف بوت"
+BTN_BOT_NEW = "➕ رفع بوت جديد"
 
-BTN_FILE_LIST = "📂 استعراض المجلد"
-BTN_FILE_UPLOAD = "⬆️ رفع ملف"
-BTN_FILE_DOWNLOAD = "⬇️ تنزيل ملف"
-BTN_FILE_READ = "📖 قراءة ملف"
-BTN_FILE_EDIT = "✏️ تعديل ملف"
-BTN_FILE_NEW = "📄 إنشاء ملف"
-BTN_FILE_MKDIR = "📁 إنشاء مجلد"
-BTN_FILE_RENAME = "✏️ إعادة تسمية"
-BTN_FILE_COPY = "📑 نسخ"
-BTN_FILE_MOVE = "🚚 نقل"
-BTN_FILE_DELETE = "🗑️ حذف"
-BTN_FILE_ZIP = "🗜️ ضغط ZIP"
-BTN_FILE_UNZIP = "📦 فك ضغط"
-BTN_FILE_SEARCH = "🔍 بحث"
-BTN_FILE_CLEAN = "🧹 تنظيف السيرفر"
+BOT_ACTION_START = "▶ تشغيل"
+BOT_ACTION_STOP = "⏹ إيقاف"
+BOT_ACTION_RESTART = "🔄 إعادة تشغيل"
+BOT_ACTION_LOGS = "📜 Logs"
+BOT_ACTION_USAGE = "📊 استهلاك الموارد"
+BOT_ACTION_FILES = "📂 الملفات"
+BOT_ACTION_SETTINGS = "⚙ الإعدادات"
+BOT_ACTION_DELETE = "🗑 حذف"
+BOT_ACTION_RENAME = "✏ إعادة تسمية"
+
+CONFIRM_YES = "✅ تأكيد"
+CONFIRM_NO = "❌ إلغاء"
+
+FILE_ACT_VIEW = "📄 عرض"
+FILE_ACT_EDIT = "✏ تعديل"
+FILE_ACT_DOWNLOAD = "📥 تنزيل"
+FILE_ACT_SHARE = "📤 مشاركة"
+FILE_ACT_COPY = "📑 نسخ"
+FILE_ACT_MOVE = "🚚 نقل"
+FILE_ACT_DELETE = "🗑 حذف"
+FILE_ACT_ZIP = "📦 ضغط"
+FILE_ACT_INFO = "ℹ معلومات"
+
+DIR_ACT_OPEN = "📂 فتح"
+DIR_ACT_DELETE = "🗑 حذف"
+DIR_ACT_ZIP = "📦 ضغط"
+DIR_ACT_RENAME = "✏ إعادة تسمية"
+DIR_ACT_MKDIR = "📁 إنشاء مجلد"
+DIR_ACT_UPLOAD = "⬆ رفع ملف داخل المجلد"
+
+FM_MKDIR = "📁 إنشاء مجلد"
+FM_UPLOAD_HERE = "⬆ رفع ملف داخل هذا المجلد"
+FM_SEARCH = "🔍 بحث"
+FM_PASTE = "📥 لصق هنا"
+
+TERM_CTRLC = "⏹️ Ctrl+C"
+TERM_CLEAR = "🧹 مسح الشاشة"
+TERM_HISTORY = "📜 آخر الأوامر"
+TERM_COPY = "📋 نسخ"
+
+BTN_REFRESH_SERVER = "🔄 تحديث السيرفر"
+BTN_DEPS_UPDATE = "📦 تحديث المكتبات"
+BTN_ENV_CHECK = "🔍 فحص البيئة"
+BTN_RESTART_BOT = "🔁 إعادة تشغيل البوت"
+
+MON_REFRESH = "🔄 تحديث"
+
+CLEAN_BTN = "🧹 تنظيف السيرفر"
 
 BTN_BACKUP_CREATE = "💾 إنشاء نسخة احتياطية"
 BTN_BACKUP_RESTORE = "♻️ استعادة نسخة"
@@ -95,7 +126,8 @@ BTN_SET_NOTIFY = "🔔 تبديل الإشعارات"
 BTN_SET_OPLOG = "🧾 سجل العمليات"
 BTN_SET_BACKUP = "💾 النسخ الاحتياطي"
 
-NAV_ROW = [BTN_BACK, BTN_HOME]
+INFO_REFRESH = "🔄 تحديث"
+INFO_COPY = "📋 نسخ المعلومات"
 
 
 def kb(rows: list[list[str]]) -> ReplyKeyboardMarkup:
@@ -105,34 +137,12 @@ def kb(rows: list[list[str]]) -> ReplyKeyboardMarkup:
     )
 
 
-MAIN_MENU = ReplyKeyboardMarkup(
+MAIN_MENU = kb(
     [
         [BTN_BOTS, BTN_FILES],
         [BTN_SERVER_INFO, BTN_TERMINAL],
         [BTN_MONITOR, BTN_SETTINGS],
-    ],
-    resize_keyboard=True,
-)
-
-BOTS_MENU = kb(
-    [
-        [BTN_BOT_START, BTN_BOT_STOP],
-        [BTN_BOT_RESTART, BTN_BOT_LOGS],
-        [BTN_BOT_LIST, BTN_BOT_UPLOAD],
-        [BTN_BOT_DELETE],
-    ]
-)
-
-FILES_MENU = kb(
-    [
-        [BTN_FILE_LIST, BTN_FILE_UPLOAD],
-        [BTN_FILE_DOWNLOAD, BTN_FILE_READ],
-        [BTN_FILE_EDIT, BTN_FILE_NEW],
-        [BTN_FILE_MKDIR, BTN_FILE_RENAME],
-        [BTN_FILE_COPY, BTN_FILE_MOVE],
-        [BTN_FILE_DELETE, BTN_FILE_ZIP],
-        [BTN_FILE_UNZIP, BTN_FILE_SEARCH],
-        [BTN_FILE_CLEAN],
+        [BTN_REFRESH_SERVER],
     ]
 )
 
@@ -142,12 +152,46 @@ SETTINGS_MENU = kb(
         [BTN_SET_ADD_ADMIN, BTN_SET_DEL_ADMIN],
         [BTN_SET_NOTIFY, BTN_SET_OPLOG],
         [BTN_SET_BACKUP],
+        [CLEAN_BTN],
+        [BTN_DEPS_UPDATE, BTN_ENV_CHECK],
+        [BTN_RESTART_BOT],
     ]
 )
 
 BACKUP_MENU = kb([[BTN_BACKUP_CREATE], [BTN_BACKUP_RESTORE], [BTN_BACKUP_SEND]])
 
-LOCKED_KEYBOARD = None  # no keyboard for unauthenticated users
+TERMINAL_MENU = kb([[TERM_CTRLC, TERM_CLEAR], [TERM_HISTORY, TERM_COPY]])
+
+BOT_DETAIL_MENU = kb(
+    [
+        [BOT_ACTION_START, BOT_ACTION_STOP],
+        [BOT_ACTION_RESTART, BOT_ACTION_LOGS],
+        [BOT_ACTION_USAGE, BOT_ACTION_FILES],
+        [BOT_ACTION_SETTINGS, BOT_ACTION_RENAME],
+        [BOT_ACTION_DELETE],
+    ]
+)
+
+FILE_ACTION_MENU = kb(
+    [
+        [FILE_ACT_VIEW, FILE_ACT_EDIT],
+        [FILE_ACT_DOWNLOAD, FILE_ACT_SHARE],
+        [FILE_ACT_COPY, FILE_ACT_MOVE],
+        [FILE_ACT_ZIP, FILE_ACT_INFO],
+        [FILE_ACT_DELETE],
+    ]
+)
+
+DIR_ACTION_MENU = kb(
+    [
+        [DIR_ACT_OPEN],
+        [DIR_ACT_MKDIR, DIR_ACT_UPLOAD],
+        [DIR_ACT_ZIP, DIR_ACT_RENAME],
+        [DIR_ACT_DELETE],
+    ]
+)
+
+CONFIRM_MENU = kb([[CONFIRM_YES, CONFIRM_NO]])
 
 # =========================================================================
 # Database
@@ -179,6 +223,7 @@ def db_init() -> None:
             pid INTEGER,
             status TEXT DEFAULT 'stopped',
             auto_restart INTEGER DEFAULT 1,
+            started_at TEXT,
             created_at TEXT
         );
         CREATE TABLE IF NOT EXISTS oplog (
@@ -194,14 +239,17 @@ def db_init() -> None:
         );
         """
     )
-    cur = conn.execute("SELECT value FROM settings WHERE key='panel_password'")
-    if cur.fetchone() is None:
+    # Backfill columns for databases created by earlier versions.
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(bots)")}
+    if "started_at" not in existing_cols:
+        conn.execute("ALTER TABLE bots ADD COLUMN started_at TEXT")
+
+    if conn.execute("SELECT value FROM settings WHERE key='panel_password'").fetchone() is None:
         conn.execute(
             "INSERT INTO settings (key, value) VALUES ('panel_password', ?)",
             (config.DEFAULT_PANEL_PASSWORD,),
         )
-    cur = conn.execute("SELECT value FROM settings WHERE key='notifications'")
-    if cur.fetchone() is None:
+    if conn.execute("SELECT value FROM settings WHERE key='notifications'").fetchone() is None:
         conn.execute("INSERT INTO settings (key, value) VALUES ('notifications', '1')")
     conn.commit()
     conn.close()
@@ -245,93 +293,18 @@ def is_admin(user_id: int) -> bool:
 
 
 # =========================================================================
-# In-memory session state (authenticated users, per-user navigation state)
-# =========================================================================
-
-AUTHENTICATED: set[int] = set()
-USER_STATE: dict[int, dict] = {}  # user_id -> {"pending": str, "data": {...}}
-
-
-def get_state(user_id: int) -> dict:
-    return USER_STATE.setdefault(user_id, {"pending": None, "data": {}})
-
-
-def reset_pending(user_id: int) -> None:
-    USER_STATE.setdefault(user_id, {})["pending"] = None
-    USER_STATE.setdefault(user_id, {})["data"] = {}
-
-
-# =========================================================================
-# Helpers
-# =========================================================================
-
-
-def safe_path(rel: str) -> Optional[Path]:
-    """Resolve a user-supplied relative path inside SERVER_PATH, refusing
-    anything that escapes the root directory."""
-    base = Path(config.SERVER_PATH).resolve()
-    try:
-        target = (base / rel).resolve()
-    except Exception:
-        return None
-    if base == target or base in target.parents:
-        return target
-    return None
-
-
-def human_size(n: float) -> str:
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f}{unit}"
-        n /= 1024
-    return f"{n:.1f}PB"
-
-
-async def run_shell(command: str, timeout: int = config.COMMAND_TIMEOUT) -> str:
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=config.SERVER_PATH,
-        )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return "⏱️ انتهت المهلة، تم إيقاف الأمر."
-        text = out.decode(errors="replace")
-        return text if text.strip() else "(لا يوجد ناتج)"
-    except Exception as exc:  # noqa: BLE001
-        return f"❌ خطأ: {exc}"
-
-
-def trim(text: str) -> str:
-    if len(text) > config.MAX_OUTPUT_CHARS:
-        return text[: config.MAX_OUTPUT_CHARS] + "\n... (تم اقتصاص الناتج)"
-    return text
-
-
-async def notify_owner(app: Application, text: str) -> None:
-    if get_setting("notifications", "1") == "1":
-        try:
-            await app.bot.send_message(chat_id=config.OWNER_ID, text=text)
-        except Exception:  # noqa: BLE001
-            log.exception("Failed to notify owner")
-
-
-# =========================================================================
-# Bot process management
+# Bot process management (DB helpers)
 # =========================================================================
 
 RUNTIME_ENTRY = {
-    "python": ("requirements.txt", ["python3", "{entry}"]),
-    "node": ("package.json", ["node", "{entry}"]),
-    "php": (None, ["php", "{entry}"]),
-    "java": (None, ["java", "-jar", "{entry}"]),
+    "python": ["python3", "{entry}"],
+    "node": ["node", "{entry}"],
+    "php": ["php", "{entry}"],
+    "java": ["java", "-jar", "{entry}"],
 }
 
 RUNNING_PROCS: dict[str, subprocess.Popen] = {}
+RUNNING_TERMINAL_PROCS: dict[int, asyncio.subprocess.Process] = {}
 
 
 def detect_runtime(path: Path) -> tuple[str, str] | None:
@@ -367,14 +340,20 @@ def db_get_bot(name: str):
 
 def db_all_bots():
     conn = db_connect()
-    rows = conn.execute("SELECT * FROM bots").fetchall()
+    rows = conn.execute("SELECT * FROM bots ORDER BY name").fetchall()
     conn.close()
     return rows
 
 
 def db_set_bot_status(name: str, status: str, pid: Optional[int]):
     conn = db_connect()
-    conn.execute("UPDATE bots SET status=?, pid=? WHERE name=?", (status, pid, name))
+    started = datetime.now().isoformat(timespec="seconds") if status == "running" else None
+    conn.execute(
+        "UPDATE bots SET status=?, pid=?, started_at=COALESCE(?, started_at) WHERE name=?",
+        (status, pid, started if status == "running" else None, name),
+    )
+    if status != "running":
+        conn.execute("UPDATE bots SET started_at=NULL WHERE name=?", (name,))
     conn.commit()
     conn.close()
 
@@ -386,23 +365,36 @@ def db_delete_bot(name: str):
     conn.close()
 
 
+def db_rename_bot(old: str, new: str):
+    conn = db_connect()
+    conn.execute("UPDATE bots SET name=? WHERE name=?", (new, old))
+    conn.commit()
+    conn.close()
+
+
+def db_toggle_autorestart(name: str) -> bool:
+    conn = db_connect()
+    row = conn.execute("SELECT auto_restart FROM bots WHERE name=?", (name,)).fetchone()
+    new_val = 0 if row and row["auto_restart"] else 1
+    conn.execute("UPDATE bots SET auto_restart=? WHERE name=?", (new_val, name))
+    conn.commit()
+    conn.close()
+    return bool(new_val)
+
+
 def start_bot_process(name: str) -> str:
     row = db_get_bot(name)
     if row is None:
         return "❌ البوت غير موجود."
     if name in RUNNING_PROCS and RUNNING_PROCS[name].poll() is None:
         return "⚠️ البوت يعمل بالفعل."
-    template = RUNTIME_ENTRY[row["runtime"]][1]
+    template = RUNTIME_ENTRY[row["runtime"]]
     cmd = [part.format(entry=row["entry"]) for part in template]
     log_file = Path(row["path"]) / "bot.log"
     try:
         with open(log_file, "ab") as lf:
             proc = subprocess.Popen(
-                cmd,
-                cwd=row["path"],
-                stdout=lf,
-                stderr=lf,
-                start_new_session=True,
+                cmd, cwd=row["path"], stdout=lf, stderr=lf, start_new_session=True,
             )
         RUNNING_PROCS[name] = proc
         db_set_bot_status(name, "running", proc.pid)
@@ -433,22 +425,16 @@ def install_requirements(path: Path, runtime: str) -> str:
     if runtime == "python" and (path / "requirements.txt").exists():
         r = subprocess.run(
             ["pip", "install", "--break-system-packages", "-r", "requirements.txt"],
-            cwd=path,
-            capture_output=True,
-            text=True,
-            timeout=300,
+            cwd=path, capture_output=True, text=True, timeout=300,
         )
         return r.stdout[-1500:] + r.stderr[-1500:]
     if runtime == "node" and (path / "package.json").exists():
-        r = subprocess.run(
-            ["npm", "install"], cwd=path, capture_output=True, text=True, timeout=300
-        )
+        r = subprocess.run(["npm", "install"], cwd=path, capture_output=True, text=True, timeout=300)
         return r.stdout[-1500:] + r.stderr[-1500:]
     return "(لا توجد متطلبات للتثبيت)"
 
 
 async def watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Periodically checks running bots and restarts crashed ones."""
     for row in db_all_bots():
         name = row["name"]
         if row["status"] != "running":
@@ -468,799 +454,775 @@ async def watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 await notify_owner(context.application, f"🔄 إعادة تشغيل تلقائي لـ {name}:\n{msg}")
 
 
+async def notify_owner(app: Application, text: str) -> None:
+    if get_setting("notifications", "1") == "1":
+        try:
+            await app.bot.send_message(chat_id=config.OWNER_ID, text=text)
+        except Exception:
+            log.exception("Failed to notify owner")
+
+
 # =========================================================================
-# Menu / navigation utilities
+# General helpers
 # =========================================================================
+
+
+def human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+
+def progress_bar(percent: float, width: int = 12) -> str:
+    percent = max(0.0, min(100.0, percent))
+    filled = round(width * percent / 100)
+    return "▓" * filled + "░" * (width - filled) + f" {percent:.1f}%"
+
+
+def trim_chunks(text: str, limit: int = config.MAX_OUTPUT_CHARS) -> list[str]:
+    if not text:
+        return ["(لا يوجد ناتج)"]
+    return [text[i : i + limit] for i in range(0, len(text), limit)] or ["(لا يوجد ناتج)"]
+
+
+def fmt_duration(seconds: float) -> str:
+    return str(timedelta(seconds=int(seconds)))
+
+
+# --- sandboxed path helpers (used for file manager root = FS_ROOT) -------
+
+
+def resolve_under(root: str, rel_or_abs: str) -> Optional[Path]:
+    base = Path(root).resolve()
+    try:
+        target = Path(rel_or_abs)
+        target = target if target.is_absolute() else base / target
+        target = target.resolve()
+    except Exception:
+        return None
+    if base == target or base in target.parents:
+        return target
+    return None
+
+
+# =========================================================================
+# Per-user session / navigation state
+#
+# We use context.user_data (persisted per chat by PTB) for all navigation
+# state so different sections never bleed into each other.
+# =========================================================================
+
+AUTHENTICATED: set[int] = set()
+
+
+def ud(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    d = context.user_data
+    d.setdefault("stack", ["main"])
+    d.setdefault("mode", None)          # None | "terminal" | "filemanager"
+    d.setdefault("pending", None)       # name of awaited free-text input, if any
+    d.setdefault("data", {})            # scratch data for the pending input
+    d.setdefault("fm_root", config.FS_ROOT)
+    d.setdefault("fm_path", config.FS_ROOT)
+    d.setdefault("fm_listing", {})      # button label -> absolute path
+    d.setdefault("fm_selected", None)
+    d.setdefault("fm_clipboard", None)  # {"op": "copy"/"move", "path": str}
+    d.setdefault("bot_selected", None)
+    d.setdefault("cmd_history", [])
+    d.setdefault("term_last", None)
+    return d
+
+
+def reset_pending(d: dict) -> None:
+    d["pending"] = None
+    d["data"] = {}
 
 
 async def show(update: Update, text: str, markup) -> None:
     await update.message.reply_text(text, reply_markup=markup)
 
 
-def push_menu(state: dict, name: str) -> None:
-    state.setdefault("stack", ["main"])
-    if state["stack"][-1] != name:
-        state["stack"].append(name)
-
-
-def pop_menu(state: dict) -> str:
-    stack = state.setdefault("stack", ["main"])
-    if len(stack) > 1:
-        stack.pop()
-    return stack[-1]
-
+# =========================================================================
+# Static-menu navigation
+# =========================================================================
 
 MENUS = {
     "main": (MAIN_MENU, "🏠 القائمة الرئيسية"),
-    "bots": (BOTS_MENU, "🤖 إدارة البوتات"),
-    "files": (FILES_MENU, "📁 إدارة الملفات"),
     "settings": (SETTINGS_MENU, "⚙️ الإعدادات"),
     "backup": (BACKUP_MENU, "💾 النسخ الاحتياطي"),
 }
 
 
-async def goto(update: Update, state: dict, name: str) -> None:
-    push_menu(state, name)
+def push_menu(d: dict, name: str) -> None:
+    if d["stack"][-1] != name:
+        d["stack"].append(name)
+
+
+def pop_menu(d: dict) -> str:
+    if len(d["stack"]) > 1:
+        d["stack"].pop()
+    return d["stack"][-1]
+
+
+async def goto_static(update: Update, d: dict, name: str) -> None:
+    d["mode"] = None
+    push_menu(d, name)
     markup, title = MENUS[name]
     await show(update, title, markup)
 
 
 # =========================================================================
-# Command / message handlers
+# BOT MANAGEMENT (fully button-driven, no typing bot names)
 # =========================================================================
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text(
-            "🛡️ Pyramid Server Manager\n\n"
-            "هذه لوحة إدارة خاصة.\n"
-            "ليس لديك صلاحية للوصول.\n\n"
-            "إذا كنت تعتقد أن هذا خطأ، يرجى التواصل مع مسؤول النظام."
-        )
-        return
-
-    if user_id in AUTHENTICATED:
-        state = get_state(user_id)
-        state["stack"] = ["main"]
-        await show(update, "🏠 القائمة الرئيسية", MAIN_MENU)
-        return
-
-    conn = db_connect()
-    row = conn.execute("SELECT * FROM login_state WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    if row and row["locked_until"]:
-        locked_until = datetime.fromisoformat(row["locked_until"])
-        if datetime.now() < locked_until:
-            remaining = int((locked_until - datetime.now()).total_seconds() // 60) + 1
-            await update.message.reply_text(f"⛔ محاولات كثيرة. حاول بعد {remaining} دقيقة.")
-            return
-
-    state = get_state(user_id)
-    state["pending"] = "await_password"
-    await update.message.reply_text("🔒 أدخل كلمة مرور لوحة التحكم.")
+def bots_list_menu() -> ReplyKeyboardMarkup:
+    rows = []
+    row = []
+    for b in db_all_bots():
+        dot = "🟢" if b["status"] == "running" else "🔴"
+        row.append(f"{dot} {b['name']}")
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([BTN_BOT_NEW])
+    return kb(rows)
 
 
-async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    user_id = update.effective_user.id
-    correct = get_setting("panel_password", config.DEFAULT_PANEL_PASSWORD)
-    conn = db_connect()
-
-    if text == correct:
-        conn.execute(
-            "INSERT INTO login_state (user_id, attempts, locked_until) VALUES (?, 0, NULL) "
-            "ON CONFLICT(user_id) DO UPDATE SET attempts=0, locked_until=NULL",
-            (user_id,),
-        )
-        conn.commit()
-        conn.close()
-        AUTHENTICATED.add(user_id)
-        reset_pending(user_id)
-        get_state(user_id)["stack"] = ["main"]
-        log_action(user_id, "login")
-        await update.message.reply_text("✅ تم تسجيل الدخول بنجاح.")
-        await show(update, "🏠 القائمة الرئيسية", MAIN_MENU)
-        return
-
-    row = conn.execute("SELECT attempts FROM login_state WHERE user_id=?", (user_id,)).fetchone()
-    attempts = (row["attempts"] if row else 0) + 1
-    if attempts >= config.MAX_LOGIN_ATTEMPTS:
-        locked_until = (datetime.now() + timedelta(minutes=config.LOCKOUT_MINUTES)).isoformat()
-        conn.execute(
-            "INSERT INTO login_state (user_id, attempts, locked_until) VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET attempts=excluded.attempts, locked_until=excluded.locked_until",
-            (user_id, attempts, locked_until),
-        )
-        conn.commit()
-        conn.close()
-        reset_pending(user_id)
-        await update.message.reply_text(
-            f"⛔ تم قفل الدخول لمدة {config.LOCKOUT_MINUTES} دقيقة بسبب المحاولات الخاطئة المتكررة."
-        )
-        await notify_owner(context.application, f"⚠️ محاولات دخول فاشلة متكررة من المستخدم {user_id}.")
-        return
-
-    conn.execute(
-        "INSERT INTO login_state (user_id, attempts, locked_until) VALUES (?, ?, NULL) "
-        "ON CONFLICT(user_id) DO UPDATE SET attempts=excluded.attempts",
-        (user_id, attempts),
-    )
-    conn.commit()
-    conn.close()
-    await update.message.reply_text("❌ كلمة المرور غير صحيحة.")
+def label_to_bot_name(label: str) -> Optional[str]:
+    for dot in ("🟢 ", "🔴 "):
+        if label.startswith(dot):
+            return label[len(dot):]
+    return None
 
 
-# --- Text router ----------------------------------------------------------
+async def open_bots_menu(update: Update, d: dict) -> None:
+    d["mode"] = None
+    d["bot_selected"] = None
+    push_menu(d, "bots")
+    await show(update, "🤖 إدارة البوتات — اختر بوتاً، أو ارفع بوتاً جديداً:", bots_list_menu())
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    if not is_admin(user_id):
-        return  # silently ignore, matches spec: stop responding entirely
-
-    state = get_state(user_id)
-
-    if user_id not in AUTHENTICATED:
-        if state.get("pending") == "await_password":
-            await handle_password(update, context, text)
-        else:
-            await start(update, context)
-        return
-
-    # Navigation
-    if text == BTN_HOME:
-        reset_pending(user_id)
-        state["stack"] = ["main"]
-        await show(update, "🏠 القائمة الرئيسية", MAIN_MENU)
-        return
-    if text == BTN_BACK:
-        reset_pending(user_id)
-        name = pop_menu(state)
-        markup, title = MENUS[name]
-        await show(update, title, markup)
-        return
-
-    # If a multi-step action is pending, route to its follow-up handler
-    if state.get("pending"):
-        await handle_pending(update, context, text)
-        return
-
-    # Main menu
-    if text == BTN_BOTS:
-        await goto(update, state, "bots")
-        return
-    if text == BTN_FILES:
-        await goto(update, state, "files")
-        return
-    if text == BTN_SETTINGS:
-        await goto(update, state, "settings")
-        return
-    if text == BTN_SERVER_INFO:
-        await send_server_info(update)
-        return
-    if text == BTN_MONITOR:
-        await send_monitor(update)
-        return
-    if text == BTN_TERMINAL:
-        state["pending"] = "terminal_cmd"
-        await update.message.reply_text("💻 أرسل أمر Linux لتنفيذه:")
-        return
-
-    # Bots submenu
-    if text == BTN_BOT_LIST:
-        await bot_list(update)
-        return
-    if text == BTN_BOT_START:
-        state["pending"] = "bot_start"
-        await update.message.reply_text("أرسل اسم البوت المراد تشغيله:")
-        return
-    if text == BTN_BOT_STOP:
-        state["pending"] = "bot_stop"
-        await update.message.reply_text("أرسل اسم البوت المراد إيقافه:")
-        return
-    if text == BTN_BOT_RESTART:
-        state["pending"] = "bot_restart"
-        await update.message.reply_text("أرسل اسم البوت المراد إعادة تشغيله:")
-        return
-    if text == BTN_BOT_LOGS:
-        state["pending"] = "bot_logs"
-        await update.message.reply_text("أرسل اسم البوت لعرض سجله:")
-        return
-    if text == BTN_BOT_DELETE:
-        state["pending"] = "bot_delete"
-        await update.message.reply_text("أرسل اسم البوت المراد حذفه:")
-        return
-    if text == BTN_BOT_UPLOAD:
-        state["pending"] = "bot_upload_name"
-        await update.message.reply_text("أرسل اسماً للبوت الجديد:")
-        return
-
-    # Files submenu
-    if text == BTN_FILE_LIST:
-        state["pending"] = "file_list"
-        await update.message.reply_text("أرسل مسار المجلد (نسبةً للجذر) أو '.' للجذر:")
-        return
-    if text == BTN_FILE_UPLOAD:
-        state["pending"] = "file_upload_path"
-        await update.message.reply_text("أرسل مسار المجلد الوجهة ثم أرفق الملف:")
-        return
-    if text == BTN_FILE_DOWNLOAD:
-        state["pending"] = "file_download"
-        await update.message.reply_text("أرسل مسار الملف المراد تنزيله:")
-        return
-    if text == BTN_FILE_READ:
-        state["pending"] = "file_read"
-        await update.message.reply_text("أرسل مسار الملف النصي لقراءته:")
-        return
-    if text == BTN_FILE_EDIT:
-        state["pending"] = "file_edit_path"
-        await update.message.reply_text("أرسل مسار الملف المراد تعديله:")
-        return
-    if text == BTN_FILE_NEW:
-        state["pending"] = "file_new_path"
-        await update.message.reply_text("أرسل مسار الملف الجديد:")
-        return
-    if text == BTN_FILE_MKDIR:
-        state["pending"] = "file_mkdir"
-        await update.message.reply_text("أرسل مسار المجلد الجديد:")
-        return
-    if text == BTN_FILE_RENAME:
-        state["pending"] = "file_rename_src"
-        await update.message.reply_text("أرسل المسار الحالي:")
-        return
-    if text == BTN_FILE_COPY:
-        state["pending"] = "file_copy_src"
-        await update.message.reply_text("أرسل مسار المصدر:")
-        return
-    if text == BTN_FILE_MOVE:
-        state["pending"] = "file_move_src"
-        await update.message.reply_text("أرسل مسار المصدر:")
-        return
-    if text == BTN_FILE_DELETE:
-        state["pending"] = "file_delete"
-        await update.message.reply_text("أرسل مسار الملف/المجلد المراد حذفه:")
-        return
-    if text == BTN_FILE_ZIP:
-        state["pending"] = "file_zip"
-        await update.message.reply_text("أرسل مسار المجلد/الملف المراد ضغطه:")
-        return
-    if text == BTN_FILE_UNZIP:
-        state["pending"] = "file_unzip"
-        await update.message.reply_text("أرسل مسار ملف ZIP لفك ضغطه:")
-        return
-    if text == BTN_FILE_SEARCH:
-        state["pending"] = "file_search"
-        await update.message.reply_text("أرسل جزءاً من اسم الملف للبحث عنه:")
-        return
-    if text == BTN_FILE_CLEAN:
-        await clean_server(update)
-        return
-
-    # Settings submenu
-    if text == BTN_SET_PASSWORD:
-        state["pending"] = "set_password"
-        await update.message.reply_text("أرسل كلمة المرور الجديدة:")
-        return
-    if text == BTN_SET_ADD_ADMIN:
-        state["pending"] = "add_admin"
-        await update.message.reply_text("أرسل معرف المستخدم (ID) المراد إضافته كمدير:")
-        return
-    if text == BTN_SET_DEL_ADMIN:
-        state["pending"] = "del_admin"
-        await update.message.reply_text("أرسل معرف المستخدم (ID) المراد حذفه من المدراء:")
-        return
-    if text == BTN_SET_NOTIFY:
-        cur = get_setting("notifications", "1")
-        new = "0" if cur == "1" else "1"
-        set_setting("notifications", new)
-        await update.message.reply_text("🔔 الإشعارات مفعلة." if new == "1" else "🔕 الإشعارات معطلة.")
-        return
-    if text == BTN_SET_OPLOG:
-        await send_oplog(update)
-        return
-    if text == BTN_SET_BACKUP:
-        await goto(update, state, "backup")
-        return
-
-    # Backup submenu
-    if text == BTN_BACKUP_CREATE:
-        await create_backup(update)
-        return
-    if text == BTN_BACKUP_RESTORE:
-        state["pending"] = "backup_restore"
-        await update.message.reply_text("أرسل اسم ملف النسخة الاحتياطية (من مجلد backups):")
-        return
-    if text == BTN_BACKUP_SEND:
-        state["pending"] = "backup_send"
-        await update.message.reply_text("أرسل اسم ملف النسخة الاحتياطية لإرسالها:")
-        return
-
-    await update.message.reply_text("لم أفهم الأمر، الرجاء استخدام الأزرار.")
+async def return_to_bots_list(update: Update, d: dict) -> None:
+    """Like open_bots_menu, but safe to call from a deeper screen (e.g. right
+    after deleting a bot from its own detail page) without leaving a stray
+    duplicate entry on the navigation stack."""
+    if d["stack"] and d["stack"][-1] == "bot_detail":
+        d["stack"].pop()
+    d["mode"] = None
+    d["bot_selected"] = None
+    if not d["stack"] or d["stack"][-1] != "bots":
+        d["stack"].append("bots")
+    await show(update, "🤖 إدارة البوتات — اختر بوتاً، أو ارفع بوتاً جديداً:", bots_list_menu())
 
 
-# --- Pending (multi-step) action handling ---------------------------------
+async def open_bot_detail(update: Update, d: dict, name: str) -> None:
+    row = db_get_bot(name)
+    if row is None:
+        await update.message.reply_text("❌ هذا البوت لم يعد موجوداً.")
+        await open_bots_menu(update, d)
+        return
+    d["bot_selected"] = name
+    push_menu(d, "bot_detail")
+    dot = "🟢 يعمل" if row["status"] == "running" else "🔴 متوقف"
+    text = f"🤖 {name}\nالحالة: {dot}\nاللغة: {row['runtime']}\nإعادة التشغيل التلقائي: {'مفعلة' if row['auto_restart'] else 'معطلة'}"
+    await show(update, text, BOT_DETAIL_MENU)
 
 
-async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    user_id = update.effective_user.id
-    state = get_state(user_id)
-    pending = state["pending"]
-
-    if pending == "terminal_cmd":
-        reset_pending(user_id)
-        log_action(user_id, f"terminal: {text}")
-        out = await run_shell(text)
-        await update.message.reply_text(f"```\n{trim(out)}\n```", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if pending == "bot_start":
-        reset_pending(user_id)
-        msg = start_bot_process(text)
-        log_action(user_id, f"start bot {text}")
-        await update.message.reply_text(msg)
-        return
-    if pending == "bot_stop":
-        reset_pending(user_id)
-        msg = stop_bot_process(text)
-        log_action(user_id, f"stop bot {text}")
-        await update.message.reply_text(msg)
-        return
-    if pending == "bot_restart":
-        reset_pending(user_id)
-        stop_bot_process(text)
-        await asyncio.sleep(1)
-        msg = start_bot_process(text)
-        log_action(user_id, f"restart bot {text}")
-        await update.message.reply_text(msg)
-        return
-    if pending == "bot_logs":
-        reset_pending(user_id)
-        row = db_get_bot(text)
-        if not row:
-            await update.message.reply_text("❌ البوت غير موجود.")
-            return
-        log_file = Path(row["path"]) / "bot.log"
-        if not log_file.exists():
-            await update.message.reply_text("(لا يوجد سجل بعد)")
-            return
-        content = log_file.read_text(errors="replace")[-config.MAX_OUTPUT_CHARS :]
-        await update.message.reply_text(f"```\n{content}\n```", parse_mode=ParseMode.MARKDOWN)
-        return
-    if pending == "bot_delete":
-        reset_pending(user_id)
-        row = db_get_bot(text)
-        if not row:
-            await update.message.reply_text("❌ البوت غير موجود.")
-            return
-        stop_bot_process(text)
-        shutil.rmtree(row["path"], ignore_errors=True)
-        db_delete_bot(text)
-        log_action(user_id, f"delete bot {text}")
-        await update.message.reply_text(f"🗑️ تم حذف {text}.")
-        return
-    if pending == "bot_upload_name":
-        name = text.strip()
-        if db_get_bot(name):
-            await update.message.reply_text("⚠️ يوجد بوت بهذا الاسم بالفعل. اختر اسماً آخر:")
-            return
-        state["data"]["bot_name"] = name
-        state["pending"] = "bot_upload_file"
-        await update.message.reply_text("الآن أرسل ملف ZIP يحتوي على كود البوت:")
-        return
-
-    # File manager text-step handlers
-    if pending == "file_list":
-        reset_pending(user_id)
-        await list_dir(update, text)
-        return
-    if pending == "file_upload_path":
-        target = safe_path(text)
-        if target is None:
-            await update.message.reply_text("❌ مسار غير صالح.")
-            reset_pending(user_id)
-            return
-        state["data"]["upload_dir"] = str(target)
-        state["pending"] = "file_upload_file"
-        await update.message.reply_text("الآن أرفق الملف لرفعه:")
-        return
-    if pending == "file_download":
-        reset_pending(user_id)
-        await download_file(update, text)
-        return
-    if pending == "file_read":
-        reset_pending(user_id)
-        await read_file(update, text)
-        return
-    if pending == "file_edit_path":
-        p = safe_path(text)
-        if p is None or not p.is_file():
-            await update.message.reply_text("❌ ملف غير موجود.")
-            reset_pending(user_id)
-            return
-        state["data"]["edit_path"] = str(p)
-        state["pending"] = "file_edit_content"
-        await update.message.reply_text("أرسل المحتوى الجديد الكامل للملف:")
-        return
-    if pending == "file_edit_content":
-        reset_pending(user_id)
-        p = Path(state["data"]["edit_path"])
-        p.write_text(text, encoding="utf-8")
-        log_action(user_id, f"edit file {p}")
-        await update.message.reply_text("✅ تم حفظ الملف.")
-        return
-    if pending == "file_new_path":
-        p = safe_path(text)
-        if p is None:
-            await update.message.reply_text("❌ مسار غير صالح.")
-            reset_pending(user_id)
-            return
-        state["data"]["new_path"] = str(p)
-        state["pending"] = "file_new_content"
-        await update.message.reply_text("أرسل محتوى الملف (أو أرسل - لإنشاء ملف فارغ):")
-        return
-    if pending == "file_new_content":
-        reset_pending(user_id)
-        p = Path(state["data"]["new_path"])
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("" if text == "-" else text, encoding="utf-8")
-        log_action(user_id, f"create file {p}")
-        await update.message.reply_text("✅ تم إنشاء الملف.")
-        return
-    if pending == "file_mkdir":
-        reset_pending(user_id)
-        p = safe_path(text)
-        if p is None:
-            await update.message.reply_text("❌ مسار غير صالح.")
-            return
-        p.mkdir(parents=True, exist_ok=True)
-        log_action(user_id, f"mkdir {p}")
-        await update.message.reply_text("✅ تم إنشاء المجلد.")
-        return
-    if pending == "file_rename_src":
-        p = safe_path(text)
-        if p is None or not p.exists():
-            await update.message.reply_text("❌ غير موجود.")
-            reset_pending(user_id)
-            return
-        state["data"]["rename_src"] = str(p)
-        state["pending"] = "file_rename_dst"
-        await update.message.reply_text("أرسل الاسم/المسار الجديد:")
-        return
-    if pending == "file_rename_dst":
-        reset_pending(user_id)
-        dst = safe_path(text)
-        if dst is None:
-            await update.message.reply_text("❌ مسار غير صالح.")
-            return
-        Path(state["data"]["rename_src"]).rename(dst)
-        log_action(user_id, f"rename to {dst}")
-        await update.message.reply_text("✅ تمت إعادة التسمية.")
-        return
-    if pending == "file_copy_src":
-        p = safe_path(text)
-        if p is None or not p.exists():
-            await update.message.reply_text("❌ غير موجود.")
-            reset_pending(user_id)
-            return
-        state["data"]["copy_src"] = str(p)
-        state["pending"] = "file_copy_dst"
-        await update.message.reply_text("أرسل المسار الوجهة:")
-        return
-    if pending == "file_copy_dst":
-        reset_pending(user_id)
-        dst = safe_path(text)
-        if dst is None:
-            await update.message.reply_text("❌ مسار غير صالح.")
-            return
-        src = Path(state["data"]["copy_src"])
-        if src.is_dir():
-            shutil.copytree(src, dst, dirs_exist_ok=True)
-        else:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-        log_action(user_id, f"copy {src} -> {dst}")
-        await update.message.reply_text("✅ تم النسخ.")
-        return
-    if pending == "file_move_src":
-        p = safe_path(text)
-        if p is None or not p.exists():
-            await update.message.reply_text("❌ غير موجود.")
-            reset_pending(user_id)
-            return
-        state["data"]["move_src"] = str(p)
-        state["pending"] = "file_move_dst"
-        await update.message.reply_text("أرسل المسار الوجهة:")
-        return
-    if pending == "file_move_dst":
-        reset_pending(user_id)
-        dst = safe_path(text)
-        if dst is None:
-            await update.message.reply_text("❌ مسار غير صالح.")
-            return
-        shutil.move(state["data"]["move_src"], dst)
-        log_action(user_id, f"move -> {dst}")
-        await update.message.reply_text("✅ تم النقل.")
-        return
-    if pending == "file_delete":
-        reset_pending(user_id)
-        p = safe_path(text)
-        if p is None or not p.exists():
-            await update.message.reply_text("❌ غير موجود.")
-            return
-        if p.is_dir():
-            shutil.rmtree(p)
-        else:
-            p.unlink()
-        log_action(user_id, f"delete {p}")
-        await update.message.reply_text("🗑️ تم الحذف.")
-        return
-    if pending == "file_zip":
-        reset_pending(user_id)
-        await zip_path(update, text)
-        return
-    if pending == "file_unzip":
-        reset_pending(user_id)
-        await unzip_path(update, text)
-        return
-    if pending == "file_search":
-        reset_pending(user_id)
-        await search_files(update, text)
-        return
-
-    if pending == "set_password":
-        reset_pending(user_id)
-        set_setting("panel_password", text)
-        log_action(user_id, "changed panel password")
-        await update.message.reply_text("✅ تم تغيير كلمة المرور.")
-        return
-    if pending == "add_admin":
-        reset_pending(user_id)
+async def bot_usage_text(row) -> str:
+    if row["pid"] and psutil.pid_exists(row["pid"]):
         try:
-            uid = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ أدخل رقم ID صحيح.")
-            return
-        conn = db_connect()
-        conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
-        conn.commit()
-        conn.close()
-        log_action(user_id, f"added admin {uid}")
-        await update.message.reply_text(f"✅ تمت إضافة {uid} كمدير.")
-        return
-    if pending == "del_admin":
-        reset_pending(user_id)
-        try:
-            uid = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ أدخل رقم ID صحيح.")
-            return
-        conn = db_connect()
-        conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
-        conn.commit()
-        conn.close()
-        log_action(user_id, f"removed admin {uid}")
-        await update.message.reply_text(f"✅ تم حذف {uid} من المدراء.")
-        return
-    if pending == "backup_restore":
-        reset_pending(user_id)
-        await restore_backup(update, text)
-        return
-    if pending == "backup_send":
-        reset_pending(user_id)
-        await send_backup(update, text)
-        return
-
-    reset_pending(user_id)
-    await update.message.reply_text("تم إلغاء العملية.")
+            pr = psutil.Process(row["pid"])
+            cpu = pr.cpu_percent(interval=0.2)
+            mem = pr.memory_percent()
+            uptime = "-"
+            if row["started_at"]:
+                started = datetime.fromisoformat(row["started_at"])
+                uptime = fmt_duration((datetime.now() - started).total_seconds())
+            return (
+                f"📊 استهلاك {row['name']}\n"
+                f"الحالة: {row['status']}\nPID: {row['pid']}\n"
+                f"CPU: {cpu:.1f}%\nRAM: {mem:.1f}%\n"
+                f"مدة التشغيل: {uptime}\nاللغة: {row['runtime']}"
+            )
+        except Exception:
+            pass
+    return f"📊 {row['name']} غير مشغل حالياً."
 
 
-# --- File manager operations ------------------------------------------
+# =========================================================================
+# FILE MANAGER (fully button-driven; root = config.FS_ROOT or a bot's dir)
+# =========================================================================
 
 
-async def list_dir(update: Update, rel: str) -> None:
-    p = safe_path(rel)
-    if p is None or not p.exists() or not p.is_dir():
-        await update.message.reply_text("❌ مجلد غير صالح.")
-        return
-    entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-    if not entries:
-        await update.message.reply_text("(المجلد فارغ)")
-        return
-    lines = []
-    for e in entries[:200]:
+def dir_listing(root: str, path: str) -> dict[str, str]:
+    """Returns {button_label: absolute_path} for entries in `path`."""
+    p = Path(path)
+    listing: dict[str, str] = {}
+    try:
+        entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+    except Exception:
+        return listing
+    for e in entries[:100]:
         tag = "📁" if e.is_dir() else "📄"
-        size = "" if e.is_dir() else f" ({human_size(e.stat().st_size)})"
-        lines.append(f"{tag} {e.name}{size}")
-    await update.message.reply_text("\n".join(lines))
+        label = f"{tag} {e.name}"
+        # de-duplicate identical labels (shouldn't normally happen)
+        base_label = label
+        i = 2
+        while label in listing:
+            label = f"{base_label} ({i})"
+            i += 1
+        listing[label] = str(e)
+    return listing
 
 
-async def download_file(update: Update, rel: str) -> None:
-    p = safe_path(rel)
-    if p is None or not p.is_file():
-        await update.message.reply_text("❌ ملف غير موجود.")
-        return
-    if p.stat().st_size > config.MAX_FILE_SIZE:
-        await update.message.reply_text("❌ الملف كبير جداً للإرسال عبر تيليجرام.")
-        return
-    with open(p, "rb") as f:
-        await update.message.reply_document(f, filename=p.name)
+def fm_menu(d: dict) -> ReplyKeyboardMarkup:
+    rows = []
+    row = []
+    for label in d["fm_listing"]:
+        row.append(label)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    action_row = [FM_MKDIR, FM_UPLOAD_HERE]
+    rows.append(action_row)
+    rows.append([FM_SEARCH])
+    if d.get("fm_clipboard"):
+        rows.append([FM_PASTE])
+    return kb(rows)
 
 
-async def read_file(update: Update, rel: str) -> None:
-    p = safe_path(rel)
-    if p is None or not p.is_file():
-        await update.message.reply_text("❌ ملف غير موجود.")
-        return
-    try:
-        content = p.read_text(errors="replace")
-    except Exception as exc:  # noqa: BLE001
-        await update.message.reply_text(f"❌ لا يمكن قراءة الملف: {exc}")
-        return
-    await update.message.reply_text(f"```\n{trim(content)}\n```", parse_mode=ParseMode.MARKDOWN)
+def return_to_filemanager(d: dict) -> None:
+    """Pop any action/search frames off the stack and land back on a single
+    normalized 'filemanager' frame — regardless of whether the action was
+    entered from the normal listing or from a search-results screen."""
+    while d["stack"] and d["stack"][-1] in ("file_actions", "dir_actions", "search_results"):
+        d["stack"].pop()
+    if not d["stack"] or d["stack"][-1] != "filemanager":
+        d["stack"].append("filemanager")
 
 
-async def zip_path(update: Update, rel: str) -> None:
-    p = safe_path(rel)
-    if p is None or not p.exists():
-        await update.message.reply_text("❌ غير موجود.")
-        return
-    out = p.with_suffix(p.suffix + ".zip") if p.is_file() else Path(str(p) + ".zip")
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
-        if p.is_file():
-            zf.write(p, p.name)
-        else:
-            for root, _, files in os.walk(p):
-                for name in files:
-                    full = Path(root) / name
-                    zf.write(full, full.relative_to(p.parent))
-    await update.message.reply_text(f"✅ تم إنشاء {out.name}")
+async def open_file_manager(update: Update, d: dict, root: str, title: str) -> None:
+    d["mode"] = "filemanager"
+    d["fm_root"] = root
+    d["fm_path"] = root
+    d["fm_clipboard"] = None
+    push_menu(d, "filemanager")
+    await render_fm(update, d, title)
 
 
-async def unzip_path(update: Update, rel: str) -> None:
-    p = safe_path(rel)
-    if p is None or not p.is_file() or p.suffix != ".zip":
-        await update.message.reply_text("❌ ملف ZIP غير صالح.")
-        return
-    dest = p.parent / p.stem
-    try:
-        with zipfile.ZipFile(p) as zf:
-            zf.extractall(dest)
-        await update.message.reply_text(f"✅ تم فك الضغط إلى {dest.name}/")
-    except Exception as exc:  # noqa: BLE001
-        await update.message.reply_text(f"❌ فشل فك الضغط: {exc}")
+async def render_fm(update: Update, d: dict, title: Optional[str] = None) -> None:
+    d["fm_listing"] = dir_listing(d["fm_root"], d["fm_path"])
+    rel = os.path.relpath(d["fm_path"], d["fm_root"])
+    loc = "/" if rel == "." else f"/{rel}"
+    header = title or f"📁 {loc}"
+    if not d["fm_listing"]:
+        header += "\n(المجلد فارغ)"
+    await show(update, header, fm_menu(d))
 
 
-async def search_files(update: Update, term: str) -> None:
-    base = Path(config.SERVER_PATH)
+async def open_file_actions(update: Update, d: dict, path: str) -> None:
+    d["fm_selected"] = path
+    push_menu(d, "file_actions")
+    p = Path(path)
+    size = human_size(p.stat().st_size) if p.exists() and p.is_file() else ""
+    await show(update, f"📄 {p.name} {size}", FILE_ACTION_MENU)
+
+
+async def open_dir_actions(update: Update, d: dict, path: str) -> None:
+    d["fm_selected"] = path
+    push_menu(d, "dir_actions")
+    await show(update, f"📁 {Path(path).name}", DIR_ACTION_MENU)
+
+
+async def fm_search(update: Update, d: dict, term: str) -> None:
+    base = Path(d["fm_root"])
     matches = []
-    for root, dirs, files in os.walk(base):
+    for root, _, files in os.walk(base):
         for name in files:
             if term.lower() in name.lower():
-                matches.append(str((Path(root) / name).relative_to(base)))
-                if len(matches) >= 50:
-                    break
-        if len(matches) >= 50:
+                matches.append(str(Path(root) / name))
+        if len(matches) >= 40:
             break
     if not matches:
-        await update.message.reply_text("لا توجد نتائج.")
+        await update.message.reply_text("لا توجد نتائج مطابقة.")
+        await render_fm(update, d)
         return
-    await update.message.reply_text("\n".join(matches))
+    listing = {}
+    rows = []
+    row = []
+    for m in matches[:40]:
+        label = f"📄 {Path(m).name}"
+        base_label = label
+        i = 2
+        while label in listing:
+            label = f"{base_label} ({i})"
+            i += 1
+        listing[label] = m
+        row.append(label)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    d["fm_listing"] = listing
+    push_menu(d, "search_results")
+    await update.message.reply_text(f"🔍 نتائج البحث عن «{term}»:", reply_markup=kb(rows))
+
+
+# =========================================================================
+# TERMINAL MODE
+# =========================================================================
+
+
+async def enter_terminal(update: Update, d: dict) -> None:
+    d["mode"] = "terminal"
+    push_menu(d, "terminal")
+    await show(
+        update,
+        "💻 وضع التريمنال مفعّل.\nأرسل أي أمر Linux وسيتم تنفيذه.\nاستخدم ⏹️ Ctrl+C لإيقاف عملية طويلة، ورجوع/الرئيسية للخروج.",
+        TERMINAL_MENU,
+    )
+
+
+async def run_terminal_command(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict, command: str) -> None:
+    user_id = update.effective_user.id
+    d["cmd_history"].append(command)
+    d["cmd_history"] = d["cmd_history"][-10:]
+    log_action(user_id, f"terminal: {command}")
+
+    start_t = time.perf_counter()
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=config.SERVER_PATH,
+            preexec_fn=os.setsid,
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"❌ خطأ في تنفيذ الأمر: {exc}")
+        return
+
+    RUNNING_TERMINAL_PROCS[user_id] = proc
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=config.COMMAND_TIMEOUT)
+        exit_code = proc.returncode
+        timed_out = False
+    except asyncio.TimeoutError:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+        out = b""
+        exit_code = -1
+        timed_out = True
+    finally:
+        RUNNING_TERMINAL_PROCS.pop(user_id, None)
+
+    elapsed = time.perf_counter() - start_t
+    output_text = out.decode(errors="replace")
+
+    if timed_out:
+        await update.message.reply_text(f"⏱️ انتهت المهلة ({config.COMMAND_TIMEOUT} ثانية) وتم إيقاف الأمر.")
+        return
+
+    footer = f"⏱️ الوقت: {elapsed:.2f}ث | 🔚 Exit code: {exit_code}"
+    full_plain = f"$ {command}\n\n{output_text}\n\n{footer}"
+    d["term_last"] = full_plain
+
+    body = f"$ {command}\n\n{output_text}"
+    # Send command + output as ONE message whenever it fits; only split when
+    # it exceeds Telegram's limits, and keep the timing/exit-code footer
+    # attached to that single message when possible.
+    if len(body) + len(footer) + 20 <= config.MAX_OUTPUT_CHARS:
+        await update.message.reply_text(
+            f"```\n{body}\n```\n{footer}", parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        chunks = trim_chunks(body)
+        for i, chunk in enumerate(chunks):
+            prefix = f"[{i+1}/{len(chunks)}]\n"
+            await update.message.reply_text(f"{prefix}```\n{chunk}\n```", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(footer)
+
+
+async def terminal_ctrlc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    proc = RUNNING_TERMINAL_PROCS.get(user_id)
+    if not proc:
+        await update.message.reply_text("لا توجد عملية قيد التشغيل حالياً.")
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        await update.message.reply_text("⏹️ تم إرسال Ctrl+C للعملية الحالية.")
+    except Exception as exc:
+        await update.message.reply_text(f"❌ تعذر إيقاف العملية: {exc}")
+
+
+# =========================================================================
+# Cleaning
+# =========================================================================
 
 
 async def clean_server(update: Update) -> None:
-    base = Path(config.SERVER_PATH)
+    start_t = time.perf_counter()
     freed = 0
     removed = 0
     now = time.time()
-    for root, dirs, files in os.walk(base):
-        if "__pycache__" in dirs:
-            pcache = Path(root) / "__pycache__"
-            freed += sum(f.stat().st_size for f in pcache.rglob("*") if f.is_file())
-            shutil.rmtree(pcache, ignore_errors=True)
-            dirs.remove("__pycache__")
-            removed += 1
-        for name in list(files):
-            fp = Path(root) / name
-            try:
-                st = fp.stat()
-            except FileNotFoundError:
-                continue
-            is_pyc = name.endswith(".pyc")
-            is_empty = st.st_size == 0
-            is_old_log = name.endswith(".log") and (now - st.st_mtime) > 30 * 86400
-            is_temp_zip = name.endswith(".tmp.zip") or name.endswith(".part")
-            if is_pyc or is_empty or is_old_log or is_temp_zip:
-                freed += st.st_size
-                fp.unlink(missing_ok=True)
-                removed += 1
+
+    # 1) walk the data dir + /tmp removing caches/pyc/pycache/empty/old logs
+    targets = [Path(config.SERVER_PATH), Path("/tmp")]
+    for base in targets:
+        if not base.exists():
+            continue
+        for root, dirs, files in os.walk(base, topdown=True):
+            if "backups" in Path(root).parts and base == Path(config.SERVER_PATH):
+                # never touch backups during cleanup
+                if Path(root) == Path(config.BACKUPS_DIR):
+                    dirs[:] = []
+                    continue
+            if "__pycache__" in dirs:
+                pcache = Path(root) / "__pycache__"
+                try:
+                    freed += sum(f.stat().st_size for f in pcache.rglob("*") if f.is_file())
+                    shutil.rmtree(pcache, ignore_errors=True)
+                    removed += 1
+                except Exception:
+                    pass
+                dirs.remove("__pycache__")
+            for name in list(files):
+                fp = Path(root) / name
+                try:
+                    st = fp.stat()
+                except (FileNotFoundError, PermissionError):
+                    continue
+                is_pyc = name.endswith(".pyc")
+                is_empty = st.st_size == 0
+                is_old_log = name.endswith(".log") and (now - st.st_mtime) > 30 * 86400
+                is_temp = name.endswith((".tmp", ".tmp.zip", ".part", ".cache"))
+                if is_pyc or is_empty or is_old_log or is_temp:
+                    try:
+                        freed += st.st_size
+                        fp.unlink(missing_ok=True)
+                        removed += 1
+                    except Exception:
+                        pass
+
+    # 2) pip cache
+    try:
+        subprocess.run(["pip", "cache", "purge"], capture_output=True, timeout=60)
+    except Exception:
+        pass
+
+    # 3) npm cache (optional, ignore failures if npm isn't installed)
+    try:
+        subprocess.run(["npm", "cache", "clean", "--force"], capture_output=True, timeout=60)
+    except Exception:
+        pass
+
+    elapsed = time.perf_counter() - start_t
     await update.message.reply_text(
-        f"🧹 تم التنظيف.\nالملفات المحذوفة: {removed}\nالمساحة المحررة: {human_size(freed)}"
+        f"🧹 اكتمل التنظيف الحقيقي.\n"
+        f"عدد الملفات المحذوفة: {removed}\n"
+        f"المساحة المحررة: {human_size(freed)}\n"
+        f"مدة التنفيذ: {elapsed:.2f} ثانية\n"
+        f"(تم أيضاً تنظيف pip cache و npm cache إن وُجدا)"
     )
 
 
-# --- Bot management views ------------------------------------------------
+# =========================================================================
+# Server refresh (non-destructive) & dependency management
+# =========================================================================
 
 
-async def bot_list(update: Update) -> None:
-    rows = db_all_bots()
-    if not rows:
-        await update.message.reply_text("لا توجد بوتات مضافة بعد.")
-        return
-    lines = [f"• {r['name']} [{r['runtime']}] — {r['status']} (PID: {r['pid'] or '-'})" for r in rows]
+async def refresh_server(update: Update) -> None:
+    """A safe, non-destructive 'refresh' of the panel's own runtime state.
+    Never deletes files, libraries, settings, bots, or databases."""
+    start_t = time.perf_counter()
+    report = []
+
+    try:
+        subprocess.run(["sync"], timeout=10, capture_output=True)
+        report.append("✅ تمت مزامنة نظام الملفات (sync)")
+    except Exception:
+        report.append("⚠️ تعذر تنفيذ sync (قد يتطلب صلاحيات إضافية)")
+
+    fixed = 0
+    for row in db_all_bots():
+        if row["status"] == "running" and row["pid"] and not psutil.pid_exists(row["pid"]):
+            db_set_bot_status(row["name"], "stopped", None)
+            fixed += 1
+    report.append(
+        f"✅ تمت مزامنة حالة {fixed} بوت مع العمليات الفعلية" if fixed
+        else "✅ حالة جميع البوتات متطابقة مع العمليات الفعلية"
+    )
+
+    restarted = 0
+    for row in db_all_bots():
+        if row["status"] == "crashed" and row["auto_restart"]:
+            msg = start_bot_process(row["name"])
+            if msg.startswith("✅"):
+                restarted += 1
+    report.append(
+        f"✅ تم إعادة تشغيل {restarted} بوت كان متعطلاً" if restarted
+        else "✅ لا توجد بوتات متعطلة تحتاج إعادة تشغيل"
+    )
+
+    stale = [uid for uid, p in RUNNING_TERMINAL_PROCS.items() if p.returncode is not None]
+    for uid in stale:
+        RUNNING_TERMINAL_PROCS.pop(uid, None)
+    report.append(
+        f"✅ تم تنظيف {len(stale)} عملية تريمنال معلّقة" if stale
+        else "✅ لا توجد عمليات تريمنال معلّقة"
+    )
+
+    psutil.cpu_percent(interval=None)  # reset internal baseline for fresh readings
+    report.append("✅ تم تحديث قراءات المعالج والموارد")
+
+    elapsed = time.perf_counter() - start_t
+    await update.message.reply_text(
+        "🔄 تقرير تحديث السيرفر (بدون حذف أي بيانات):\n\n" + "\n".join(report) +
+        f"\n\n⏱️ مدة التنفيذ: {elapsed:.2f} ثانية"
+    )
+
+
+def project_requirements_path() -> Path:
+    return Path(__file__).resolve().parent / "requirements.txt"
+
+
+def parse_requirements(path: Path) -> list[tuple[str, Optional[str]]]:
+    reqs: list[tuple[str, Optional[str]]] = []
+    if not path.exists():
+        return reqs
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "==" in line:
+            pkg, ver = line.split("==", 1)
+            reqs.append((pkg.strip(), ver.strip()))
+        else:
+            pkg = line
+            for sep in ("[", ">=", "<=", "!=", ">", "<"):
+                pkg = pkg.split(sep)[0]
+            reqs.append((pkg.strip(), None))
+    return reqs
+
+
+def check_environment() -> list[tuple[str, Optional[str], str, Optional[str]]]:
+    """Returns (package, required_version_or_None, status, installed_version_or_None).
+    status is one of: 'installed', 'update', 'missing'."""
+    results = []
+    for pkg, ver in parse_requirements(project_requirements_path()):
+        try:
+            installed_ver = importlib_metadata.version(pkg)
+        except importlib_metadata.PackageNotFoundError:
+            results.append((pkg, ver, "missing", None))
+            continue
+        if ver and installed_ver != ver:
+            results.append((pkg, ver, "update", installed_ver))
+        else:
+            results.append((pkg, ver, "installed", installed_ver))
+    return results
+
+
+async def update_dependencies() -> str:
+    results = check_environment()
+    to_install = [r for r in results if r[2] != "installed"]
+    if not to_install:
+        return f"✅ تم فحص {len(results)} مكتبة\n✅ كل المكتبات محدثة\n✅ لا توجد أخطاء"
+
+    updated = 0
+    errors = []
+    for pkg, ver, status, _installed in to_install:
+        spec = f"{pkg}=={ver}" if ver else pkg
+        try:
+            r = subprocess.run(
+                ["pip", "install", "--break-system-packages", spec],
+                capture_output=True, text=True, timeout=180,
+            )
+            if r.returncode == 0:
+                updated += 1
+            else:
+                errors.append(f"{pkg}: {r.stderr.strip()[-200:]}")
+        except Exception as exc:
+            errors.append(f"{pkg}: {exc}")
+
+    report = f"✅ تم فحص {len(results)} مكتبة\n✅ تم تحديث {updated} مكتبة"
+    report += ("\n❌ أخطاء:\n" + "\n".join(errors[:5])) if errors else "\n✅ لا توجد أخطاء"
+    return report
+
+
+async def send_env_check(update: Update) -> None:
+    results = check_environment()
+    icon = {"installed": "✅ مثبتة", "update": "⬆ تحتاج تحديث", "missing": "❌ غير مثبتة"}
+    lines = [
+        f"Python: {platform.python_version()}",
+        f"pip: {get_version(['pip', '--version'])}",
+        "",
+        "📦 المكتبات المطلوبة:",
+    ]
+    if not results:
+        lines.append("(لم يتم العثور على requirements.txt)")
+    for pkg, ver, status, installed_ver in results:
+        extra = f" (الحالي: {installed_ver})" if installed_ver else ""
+        lines.append(f"• {pkg}{f' {ver}' if ver else ''}: {icon[status]}{extra}")
     await update.message.reply_text("\n".join(lines))
 
 
-# --- Server info / monitoring -------------------------------------------
+async def restart_bot_process(update: Update) -> None:
+    await update.message.reply_text("🔁 جاري إعادة تشغيل البوت...")
+    python = sys.executable
+    os.execv(python, [python] + sys.argv)
+
+
+async def post_init(app: Application) -> None:
+    """Runs once on startup: auto-checks/installs missing or mismatched
+    dependencies from requirements.txt and notifies the owner of the result."""
+    try:
+        results = check_environment()
+        missing_or_stale = [r for r in results if r[2] != "installed"]
+        if missing_or_stale:
+            report = await update_dependencies()
+            await notify_owner(app, f"📦 فحص تلقائي عند بدء التشغيل:\n{report}")
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await app.bot.send_message(chat_id=config.OWNER_ID, text=f"⚠️ خطأ أثناء الفحص التلقائي للمكتبات: {exc}")
+        except Exception:
+            pass
+
+
+# =========================================================================
+# Server info / monitoring
+# =========================================================================
 
 
 def get_version(cmd: list[str]) -> str:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        return (r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else "غير مثبت"
+        out = (r.stdout or r.stderr).strip()
+        return out.splitlines()[0] if out else "غير مثبت"
     except Exception:
         return "غير مثبت"
 
 
-async def send_server_info(update: Update) -> None:
-    cpu = psutil.cpu_percent(interval=0.5)
-    mem = psutil.virtual_memory()
-    disk = psutil.disk_usage(config.SERVER_PATH)
-    uptime = timedelta(seconds=int(time.time() - psutil.boot_time()))
+def get_external_ip() -> str:
     try:
-        ip = socket.gethostbyname(socket.gethostname())
+        with urllib.request.urlopen(config.EXTERNAL_IP_SERVICE, timeout=4) as resp:
+            return resp.read().decode().strip()
     except Exception:
-        ip = "غير معروف"
+        return "غير متاح"
 
-    text = (
-        f"🖥️ *معلومات السيرفر*\n"
-        f"CPU: {cpu}%\n"
-        f"RAM: {human_size(mem.used)} / {human_size(mem.total)} ({mem.percent}%)\n"
-        f"Disk: {human_size(disk.used)} / {human_size(disk.total)} ({disk.percent}%)\n"
+
+async def build_server_info_text() -> str:
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage(config.FS_ROOT if os.path.exists(config.FS_ROOT) else "/")
+    uptime = fmt_duration(time.time() - psutil.boot_time())
+    boot_time = datetime.fromtimestamp(psutil.boot_time()).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        load1, load5, load15 = os.getloadavg()
+        load_txt = f"{load1:.2f} / {load5:.2f} / {load15:.2f}"
+    except (AttributeError, OSError):
+        load_txt = "غير متاح"
+    external_ip = get_external_ip()
+    try:
+        local_ip = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        local_ip = "غير معروف"
+
+    return (
+        f"🖥️ *معلومات السيرفر*\n\n"
+        f"نظام التشغيل: {platform.system()} {platform.release()}\n"
+        f"الإصدار: {platform.version()[:60]}\n"
+        f"عدد الأنوية: {psutil.cpu_count(logical=True)}\n"
+        f"Load Average: {load_txt}\n\n"
+        f"CPU: {progress_bar(psutil.cpu_percent(interval=0.3))}\n"
+        f"RAM: {progress_bar(mem.percent)} ({human_size(mem.used)}/{human_size(mem.total)})\n"
+        f"Disk: {progress_bar(disk.percent)} ({human_size(disk.used)}/{human_size(disk.total)})\n"
+        f"المساحة الحرة: {human_size(disk.free)}\n\n"
         f"Uptime: {uptime}\n"
+        f"آخر إقلاع (Restart): {boot_time}\n\n"
         f"Python: {platform.python_version()}\n"
         f"PHP: {get_version(['php', '-v'])}\n"
         f"Node: {get_version(['node', '-v'])}\n"
-        f"Java: {get_version(['java', '-version'])}\n"
-        f"Kernel: {platform.release()}\n"
+        f"Java: {get_version(['java', '-version'])}\n\n"
         f"Hostname: {socket.gethostname()}\n"
-        f"IP: {ip}"
+        f"IP المحلي: {local_ip}\n"
+        f"IP الخارجي: {external_ip}"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+def server_info_menu() -> ReplyKeyboardMarkup:
+    return kb([[INFO_REFRESH, INFO_COPY]])
+
+
+async def send_server_info(update: Update) -> None:
+    text = await build_server_info_text()
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=server_info_menu())
+
+
+def monitor_menu() -> ReplyKeyboardMarkup:
+    rows = []
+    row = []
+    for b in db_all_bots():
+        dot = "🟢" if b["status"] == "running" else "🔴"
+        row.append(f"{dot} {b['name']}")
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([MON_REFRESH])
+    return kb(rows)
+
+
+async def build_monitor_text() -> str:
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    net = psutil.net_io_counters()
+    uptime = fmt_duration(time.time() - psutil.boot_time())
+
+    lines = [
+        "📊 *مراقبة الموارد*\n",
+        f"CPU: {progress_bar(psutil.cpu_percent(interval=0.3))}",
+        f"RAM: {progress_bar(mem.percent)} ({human_size(mem.used)}/{human_size(mem.total)})",
+        f"Disk: {progress_bar(disk.percent)} ({human_size(disk.used)}/{human_size(disk.total)})",
+        f"Network: ⬆ {human_size(net.bytes_sent)} | ⬇ {human_size(net.bytes_recv)}",
+        f"Uptime: {uptime}\n",
+        "🤖 *البوتات النشطة*",
+    ]
+    rows = db_all_bots()
+    if not rows:
+        lines.append("لا توجد بوتات مضافة حتى الآن. أضف بوتاً من قسم «🤖 إدارة البوتات».")
+    else:
+        for r in rows:
+            if r["pid"] and psutil.pid_exists(r["pid"]):
+                try:
+                    pr = psutil.Process(r["pid"])
+                    cpu = pr.cpu_percent(interval=0.1)
+                    ram = pr.memory_percent()
+                    up = "-"
+                    if r["started_at"]:
+                        up = fmt_duration((datetime.now() - datetime.fromisoformat(r["started_at"])).total_seconds())
+                    lines.append(
+                        f"• {r['name']} [{r['runtime']}] 🟢 | PID {r['pid']} | CPU {cpu:.1f}% | RAM {ram:.1f}% | {up}"
+                    )
+                    continue
+                except Exception:
+                    pass
+            lines.append(f"• {r['name']} [{r['runtime']}] 🔴 متوقف")
+    return "\n".join(lines)
 
 
 async def send_monitor(update: Update) -> None:
-    procs = sorted(
-        psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]),
-        key=lambda p: p.info["cpu_percent"] or 0,
-        reverse=True,
-    )[:8]
-    lines = ["📊 *أكثر العمليات استهلاكاً:*"]
-    for p in procs:
-        lines.append(
-            f"PID {p.info['pid']} | {p.info['name']} | CPU {p.info['cpu_percent']:.1f}% | RAM {p.info['memory_percent']:.1f}%"
-        )
-
-    lines.append("\n🤖 *استهلاك البوتات:*")
-    rows = db_all_bots()
-    if not rows:
-        lines.append("(لا توجد بوتات)")
-    for r in rows:
-        if r["pid"] and psutil.pid_exists(r["pid"]):
-            try:
-                pr = psutil.Process(r["pid"])
-                lines.append(
-                    f"{r['name']}: CPU {pr.cpu_percent(interval=0.1):.1f}% | "
-                    f"RAM {pr.memory_percent():.1f}% | PID {r['pid']} | {r['status']}"
-                )
-                continue
-            except Exception:
-                pass
-        lines.append(f"{r['name']}: {r['status']} (PID: -)")
-
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    text = await build_monitor_text()
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=monitor_menu())
 
 
 async def send_oplog(update: Update) -> None:
@@ -1271,10 +1233,13 @@ async def send_oplog(update: Update) -> None:
         await update.message.reply_text("لا يوجد سجل عمليات بعد.")
         return
     lines = [f"[{r['ts']}] user {r['user_id']}: {r['action']}" for r in rows]
-    await update.message.reply_text(trim("\n".join(lines)))
+    for chunk in trim_chunks("\n".join(lines)):
+        await update.message.reply_text(chunk)
 
 
-# --- Backups --------------------------------------------------------------
+# =========================================================================
+# Backups
+# =========================================================================
 
 
 async def create_backup(update: Update) -> None:
@@ -1301,7 +1266,7 @@ async def restore_backup(update: Update, name: str) -> None:
         with zipfile.ZipFile(src) as zf:
             zf.extractall(config.SERVER_PATH)
         await update.message.reply_text("✅ تمت الاستعادة.")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         await update.message.reply_text(f"❌ فشلت الاستعادة: {exc}")
 
 
@@ -1314,35 +1279,804 @@ async def send_backup(update: Update, name: str) -> None:
         await update.message.reply_document(f, filename=src.name)
 
 
-# --- Document (file/bot upload) handler -----------------------------------
+# =========================================================================
+# /start & authentication
+# =========================================================================
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "🛡️ Pyramid Server Manager\n\n"
+            "هذه لوحة إدارة خاصة.\n"
+            "ليس لديك صلاحية للوصول.\n\n"
+            "إذا كنت تعتقد أن هذا خطأ، يرجى التواصل مع مسؤول النظام."
+        )
+        return
+
+    d = ud(context)
+    if user_id in AUTHENTICATED:
+        d["stack"] = ["main"]
+        d["mode"] = None
+        await show(update, "🏠 القائمة الرئيسية", MAIN_MENU)
+        return
+
+    conn = db_connect()
+    row = conn.execute("SELECT * FROM login_state WHERE user_id=?", (user_id,)).fetchone()
+    conn.close()
+    if row and row["locked_until"]:
+        locked_until = datetime.fromisoformat(row["locked_until"])
+        if datetime.now() < locked_until:
+            remaining = int((locked_until - datetime.now()).total_seconds() // 60) + 1
+            await update.message.reply_text(f"⛔ محاولات كثيرة. حاول بعد {remaining} دقيقة.")
+            return
+
+    d["pending"] = "await_password"
+    await update.message.reply_text("🔒 أدخل كلمة مرور لوحة التحكم.")
+
+
+async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    user_id = update.effective_user.id
+    d = ud(context)
+    correct = get_setting("panel_password", config.DEFAULT_PANEL_PASSWORD)
+    conn = db_connect()
+
+    if text == correct:
+        conn.execute(
+            "INSERT INTO login_state (user_id, attempts, locked_until) VALUES (?, 0, NULL) "
+            "ON CONFLICT(user_id) DO UPDATE SET attempts=0, locked_until=NULL",
+            (user_id,),
+        )
+        conn.commit()
+        conn.close()
+        AUTHENTICATED.add(user_id)
+        reset_pending(d)
+        d["stack"] = ["main"]
+        d["mode"] = None
+        log_action(user_id, "login")
+        await update.message.reply_text("✅ تم تسجيل الدخول بنجاح.")
+        await show(update, "🏠 القائمة الرئيسية", MAIN_MENU)
+        return
+
+    row = conn.execute("SELECT attempts FROM login_state WHERE user_id=?", (user_id,)).fetchone()
+    attempts = (row["attempts"] if row else 0) + 1
+    if attempts >= config.MAX_LOGIN_ATTEMPTS:
+        locked_until = (datetime.now() + timedelta(minutes=config.LOCKOUT_MINUTES)).isoformat()
+        conn.execute(
+            "INSERT INTO login_state (user_id, attempts, locked_until) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET attempts=excluded.attempts, locked_until=excluded.locked_until",
+            (user_id, attempts, locked_until),
+        )
+        conn.commit()
+        conn.close()
+        reset_pending(d)
+        await update.message.reply_text(
+            f"⛔ تم قفل الدخول لمدة {config.LOCKOUT_MINUTES} دقيقة بسبب المحاولات الخاطئة المتكررة."
+        )
+        await notify_owner(context.application, f"⚠️ محاولات دخول فاشلة متكررة من المستخدم {user_id}.")
+        return
+
+    conn.execute(
+        "INSERT INTO login_state (user_id, attempts, locked_until) VALUES (?, ?, NULL) "
+        "ON CONFLICT(user_id) DO UPDATE SET attempts=excluded.attempts",
+        (user_id, attempts),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("❌ كلمة المرور غير صحيحة.")
+
+
+# =========================================================================
+# Central text router
+# =========================================================================
+
+
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    if not is_admin(user_id):
+        return
+
+    d = ud(context)
+
+    if user_id not in AUTHENTICATED:
+        if d.get("pending") == "await_password":
+            await handle_password(update, context, text)
+        else:
+            await start(update, context)
+        return
+
+    # --- global navigation ------------------------------------------------
+    if text == BTN_HOME:
+        reset_pending(d)
+        d["mode"] = None
+        d["stack"] = ["main"]
+        d["fm_clipboard"] = None
+        await show(update, "🏠 القائمة الرئيسية", MAIN_MENU)
+        return
+
+    if text == BTN_BACK:
+        await handle_back(update, d)
+        return
+
+    # --- pending free-text input (rename, mkdir name, search term, etc.) --
+    if d.get("pending"):
+        await handle_pending(update, context, d, text)
+        return
+
+    # --- terminal mode: everything else is a shell command ---------------
+    if d["mode"] == "terminal":
+        if text == TERM_CTRLC:
+            await terminal_ctrlc(update, context)
+            return
+        if text == TERM_CLEAR:
+            await update.message.reply_text("🧹 تم مسح الشاشة.\n💻 التريمنال جاهز لأمر جديد.")
+            return
+        if text == TERM_HISTORY:
+            hist = d["cmd_history"]
+            await update.message.reply_text("📜 آخر الأوامر:\n" + ("\n".join(hist) if hist else "(لا يوجد سجل بعد)"))
+            return
+        if text == TERM_COPY:
+            last = d.get("term_last")
+            if not last:
+                await update.message.reply_text("لا يوجد ناتج سابق لنسخه بعد.")
+                return
+            for chunk in trim_chunks(last):
+                await update.message.reply_text(chunk)
+            return
+        await run_terminal_command(update, context, d, text)
+        return
+
+    # --- file manager mode: resolve tapped entry/action buttons -----------
+    if d["mode"] == "filemanager":
+        if await handle_filemanager_text(update, context, d, text):
+            return
+        # falls through to global menu matching below (in case of stale kb)
+
+    # --- main menu ----------------------------------------------------
+    if text == BTN_BOTS:
+        await open_bots_menu(update, d)
+        return
+    if text == BTN_FILES:
+        await open_file_manager(update, d, config.FS_ROOT, f"📁 مستعرض الملفات — /root")
+        return
+    if text == BTN_SETTINGS:
+        await goto_static(update, d, "settings")
+        return
+    if text == BTN_SERVER_INFO:
+        push_menu(d, "server_info")
+        await send_server_info(update)
+        return
+    if text == BTN_MONITOR:
+        push_menu(d, "monitor")
+        await send_monitor(update)
+        return
+    if text == BTN_TERMINAL:
+        await enter_terminal(update, d)
+        return
+    if text == BTN_REFRESH_SERVER:
+        await refresh_server(update)
+        return
+
+    # --- server info screen buttons ------------------------------------
+    if text == INFO_REFRESH:
+        await send_server_info(update)
+        return
+    if text == INFO_COPY:
+        info_text = await build_server_info_text()
+        plain = info_text.replace("*", "")
+        await update.message.reply_text(f"```\n{plain}\n```", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # --- monitor screen buttons -----------------------------------------
+    if text == MON_REFRESH:
+        await send_monitor(update)
+        return
+    bot_name = label_to_bot_name(text)
+    if bot_name and d["stack"][-1] == "monitor":
+        await open_bot_detail(update, d, bot_name)
+        return
+
+    # --- bots list buttons -----------------------------------------------
+    if bot_name and d["stack"][-1] == "bots":
+        await open_bot_detail(update, d, bot_name)
+        return
+    if text == BTN_BOT_NEW:
+        d["pending"] = "bot_upload_name"
+        await update.message.reply_text("أرسل اسماً للبوت الجديد:")
+        return
+
+    # --- bot detail buttons ------------------------------------------------
+    if d["stack"][-1] == "bot_detail" and d.get("bot_selected"):
+        if await handle_bot_detail_action(update, context, d, text):
+            return
+
+    # --- settings submenu --------------------------------------------------
+    if text == BTN_SET_PASSWORD:
+        d["pending"] = "set_password"
+        await update.message.reply_text("أرسل كلمة المرور الجديدة:")
+        return
+    if text == BTN_SET_ADD_ADMIN:
+        d["pending"] = "add_admin"
+        await update.message.reply_text("أرسل معرف المستخدم (ID) المراد إضافته كمدير:")
+        return
+    if text == BTN_SET_DEL_ADMIN:
+        d["pending"] = "del_admin"
+        await update.message.reply_text("أرسل معرف المستخدم (ID) المراد حذفه من المدراء:")
+        return
+    if text == BTN_SET_NOTIFY:
+        cur = get_setting("notifications", "1")
+        new = "0" if cur == "1" else "1"
+        set_setting("notifications", new)
+        await update.message.reply_text("🔔 الإشعارات مفعلة." if new == "1" else "🔕 الإشعارات معطلة.")
+        return
+    if text == BTN_SET_OPLOG:
+        await send_oplog(update)
+        return
+    if text == BTN_SET_BACKUP:
+        await goto_static(update, d, "backup")
+        return
+
+    # --- backup submenu -----------------------------------------------------
+    if text == BTN_BACKUP_CREATE:
+        await create_backup(update)
+        return
+    if text == BTN_BACKUP_RESTORE:
+        d["pending"] = "backup_restore"
+        await update.message.reply_text("أرسل اسم ملف النسخة الاحتياطية (من مجلد backups):")
+        return
+    if text == BTN_BACKUP_SEND:
+        d["pending"] = "backup_send"
+        await update.message.reply_text("أرسل اسم ملف النسخة الاحتياطية لإرسالها:")
+        return
+
+    if text == CLEAN_BTN:
+        await clean_server(update)
+        return
+    if text == BTN_DEPS_UPDATE:
+        await update.message.reply_text("📦 جاري فحص وتحديث المكتبات...")
+        report = await update_dependencies()
+        await update.message.reply_text(report)
+        return
+    if text == BTN_ENV_CHECK:
+        await send_env_check(update)
+        return
+    if text == BTN_RESTART_BOT:
+        await restart_bot_process(update)
+        return
+
+    await update.message.reply_text("لم أفهم الأمر، الرجاء استخدام الأزرار.")
+
+
+# --- BACK navigation, context-aware ----------------------------------------
+
+
+async def show_menu_by_name(update: Update, d: dict, name: str) -> None:
+    """Render whichever screen `name` refers to (works for both static menus
+    and the dynamic ones that need fresh data each time)."""
+    if name == "bots":
+        await show(update, "🤖 إدارة البوتات — اختر بوتاً، أو ارفع بوتاً جديداً:", bots_list_menu())
+        return
+    if name == "bot_detail" and d.get("bot_selected"):
+        await refresh_bot_detail_message(update, d["bot_selected"])
+        return
+    if name == "monitor":
+        await send_monitor(update)
+        return
+    if name == "server_info":
+        await send_server_info(update)
+        return
+    markup, title = MENUS.get(name, (MAIN_MENU, "🏠 القائمة الرئيسية"))
+    await show(update, title, markup)
+
+
+async def handle_back(update: Update, d: dict) -> None:
+    reset_pending(d)
+
+    if d["mode"] == "filemanager" and d["stack"][-1] in ("filemanager",):
+        # Step up a directory if not already at the file-manager root.
+        if os.path.normpath(d["fm_path"]) != os.path.normpath(d["fm_root"]):
+            d["fm_path"] = str(Path(d["fm_path"]).parent)
+            await render_fm(update, d)
+            return
+        # already at root -> leave file manager entirely, back to whichever
+        # screen it was opened from (main files section or a bot's page)
+        d["mode"] = None
+        d["fm_clipboard"] = None
+        name = pop_menu(d)
+        await show_menu_by_name(update, d, name)
+        return
+
+    if d["stack"][-1] in ("file_actions", "dir_actions", "search_results"):
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return
+
+    if d["mode"] == "terminal":
+        d["mode"] = None
+        pop_menu(d)
+
+    if d["stack"][-1] == "bot_detail":
+        d["bot_selected"] = None
+        d["stack"].pop()
+        await show(update, "🤖 إدارة البوتات — اختر بوتاً، أو ارفع بوتاً جديداً:", bots_list_menu())
+        return
+
+    name = pop_menu(d)
+    await show_menu_by_name(update, d, name)
+
+
+# --- File manager text-button dispatch --------------------------------------
+
+
+async def handle_filemanager_text(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict, text: str) -> bool:
+    """Returns True if the text was handled as a file-manager action."""
+
+    if d["stack"][-1] == "filemanager":
+        if text == FM_MKDIR:
+            d["pending"] = "fm_mkdir"
+            await update.message.reply_text("أرسل اسم المجلد الجديد:")
+            return True
+        if text == FM_UPLOAD_HERE:
+            d["pending"] = "fm_upload_file"
+            await update.message.reply_text("أرسل الملف الآن ليتم رفعه داخل هذا المجلد:")
+            return True
+        if text == FM_SEARCH:
+            d["pending"] = "fm_search_term"
+            await update.message.reply_text("أرسل اسم الملف (أو جزءاً منه) للبحث:")
+            return True
+        if text == FM_PASTE:
+            await fm_paste(update, d)
+            return True
+        if text in d["fm_listing"]:
+            target = d["fm_listing"][text]
+            if Path(target).is_dir():
+                await open_dir_actions(update, d, target)
+            else:
+                await open_file_actions(update, d, target)
+            return True
+        return False
+
+    if d["stack"][-1] == "search_results":
+        if text in d["fm_listing"]:
+            target = d["fm_listing"][text]
+            await open_file_actions(update, d, target)
+            return True
+        return False
+
+    if d["stack"][-1] == "file_actions":
+        return await handle_file_action(update, context, d, text)
+
+    if d["stack"][-1] == "dir_actions":
+        return await handle_dir_action(update, context, d, text)
+
+    return False
+
+
+async def fm_paste(update: Update, d: dict) -> None:
+    clip = d.get("fm_clipboard")
+    if not clip:
+        await update.message.reply_text("لا يوجد عنصر منسوخ حالياً.")
+        return
+    src = Path(clip["path"])
+    dst = Path(d["fm_path"]) / src.name
+    try:
+        if clip["op"] == "copy":
+            if src.is_dir():
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+            await update.message.reply_text(f"✅ تم نسخ {src.name} هنا.")
+        else:
+            shutil.move(str(src), str(dst))
+            await update.message.reply_text(f"✅ تم نقل {src.name} هنا.")
+    except Exception as exc:
+        await update.message.reply_text(f"❌ فشلت العملية: {exc}")
+    d["fm_clipboard"] = None
+    await render_fm(update, d)
+
+
+async def handle_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict, text: str) -> bool:
+    user_id = update.effective_user.id
+    path = d.get("fm_selected")
+    if not path:
+        return False
+    p = Path(path)
+
+    if text == FILE_ACT_VIEW:
+        try:
+            content = p.read_text(errors="replace")
+        except Exception as exc:
+            await update.message.reply_text(f"❌ لا يمكن قراءة الملف: {exc}")
+            return True
+        for chunk in trim_chunks(content):
+            await update.message.reply_text(f"```\n{chunk}\n```", parse_mode=ParseMode.MARKDOWN)
+        return True
+
+    if text == FILE_ACT_EDIT:
+        d["pending"] = "fm_edit_content"
+        await update.message.reply_text("أرسل المحتوى الجديد الكامل للملف:")
+        return True
+
+    if text in (FILE_ACT_DOWNLOAD, FILE_ACT_SHARE):
+        if p.stat().st_size > config.MAX_FILE_SIZE:
+            await update.message.reply_text("❌ الملف كبير جداً للإرسال عبر تيليجرام.")
+            return True
+        with open(p, "rb") as f:
+            await update.message.reply_document(f, filename=p.name)
+        return True
+
+    if text == FILE_ACT_COPY:
+        d["fm_clipboard"] = {"op": "copy", "path": str(p)}
+        await update.message.reply_text("📑 تم نسخ الملف. انتقل إلى المجلد الوجهة ثم اضغط «📥 لصق هنا».")
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return True
+
+    if text == FILE_ACT_MOVE:
+        d["fm_clipboard"] = {"op": "move", "path": str(p)}
+        await update.message.reply_text("🚚 جاهز للنقل. انتقل إلى المجلد الوجهة ثم اضغط «📥 لصق هنا».")
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return True
+
+    if text == FILE_ACT_ZIP:
+        out = p.with_suffix(p.suffix + ".zip")
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(p, p.name)
+        log_action(user_id, f"zip {p}")
+        await update.message.reply_text(f"✅ تم إنشاء {out.name}")
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return True
+
+    if text == FILE_ACT_INFO:
+        st = p.stat()
+        info = (
+            f"ℹ️ {p.name}\nالحجم: {human_size(st.st_size)}\n"
+            f"آخر تعديل: {datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"الصلاحيات: {oct(st.st_mode)[-3:]}"
+        )
+        await update.message.reply_text(info)
+        return True
+
+    if text == FILE_ACT_DELETE:
+        d["pending"] = "fm_confirm_delete"
+        await update.message.reply_text(f"هل أنت متأكد من حذف {p.name}؟", reply_markup=CONFIRM_MENU)
+        return True
+
+    return False
+
+
+async def handle_dir_action(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict, text: str) -> bool:
+    user_id = update.effective_user.id
+    path = d.get("fm_selected")
+    if not path:
+        return False
+    p = Path(path)
+
+    if text == DIR_ACT_OPEN:
+        d["fm_path"] = str(p)
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return True
+
+    if text == DIR_ACT_ZIP:
+        out = Path(str(p) + ".zip")
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(p):
+                for name in files:
+                    full = Path(root) / name
+                    zf.write(full, full.relative_to(p.parent))
+        log_action(user_id, f"zip dir {p}")
+        await update.message.reply_text(f"✅ تم إنشاء {out.name}")
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return True
+
+    if text == DIR_ACT_RENAME:
+        d["pending"] = "fm_rename_new_name"
+        await update.message.reply_text("أرسل الاسم الجديد للمجلد:")
+        return True
+
+    if text == DIR_ACT_MKDIR:
+        d["pending"] = "fm_mkdir_in_selected"
+        await update.message.reply_text(f"أرسل اسم المجلد الجديد داخل {p.name}:")
+        return True
+
+    if text == DIR_ACT_UPLOAD:
+        d["pending"] = "fm_upload_into_selected"
+        await update.message.reply_text(f"أرسل الملف الآن ليُرفع داخل {p.name}:")
+        return True
+
+    if text == DIR_ACT_DELETE:
+        d["pending"] = "fm_confirm_delete"
+        await update.message.reply_text(f"هل أنت متأكد من حذف المجلد {p.name} وكل محتوياته؟", reply_markup=CONFIRM_MENU)
+        return True
+
+    return False
+
+
+async def refresh_bot_detail_message(update: Update, name: str) -> None:
+    """Resend the bot-detail screen with fresh status, without touching the
+    navigation stack (used after start/stop/restart while already on that screen)."""
+    row = db_get_bot(name)
+    if row is None:
+        return
+    dot = "🟢 يعمل" if row["status"] == "running" else "🔴 متوقف"
+    text = (
+        f"🤖 {name}\nالحالة: {dot}\nاللغة: {row['runtime']}\n"
+        f"إعادة التشغيل التلقائي: {'مفعلة' if row['auto_restart'] else 'معطلة'}"
+    )
+    await update.message.reply_text(text, reply_markup=BOT_DETAIL_MENU)
+
+
+async def handle_bot_detail_action(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict, text: str) -> bool:
+    user_id = update.effective_user.id
+    name = d["bot_selected"]
+
+    if text == BOT_ACTION_START:
+        msg = start_bot_process(name)
+        log_action(user_id, f"start bot {name}")
+        await update.message.reply_text(msg)
+        await refresh_bot_detail_message(update, name)
+        return True
+    if text == BOT_ACTION_STOP:
+        msg = stop_bot_process(name)
+        log_action(user_id, f"stop bot {name}")
+        await update.message.reply_text(msg)
+        await refresh_bot_detail_message(update, name)
+        return True
+    if text == BOT_ACTION_RESTART:
+        stop_bot_process(name)
+        await asyncio.sleep(1)
+        msg = start_bot_process(name)
+        log_action(user_id, f"restart bot {name}")
+        await update.message.reply_text(msg)
+        await refresh_bot_detail_message(update, name)
+        return True
+    if text == BOT_ACTION_LOGS:
+        row = db_get_bot(name)
+        log_file = Path(row["path"]) / "bot.log"
+        if not log_file.exists():
+            await update.message.reply_text("(لا يوجد سجل بعد)")
+        else:
+            content = log_file.read_text(errors="replace")[-config.MAX_OUTPUT_CHARS :]
+            await update.message.reply_text(f"```\n{content}\n```", parse_mode=ParseMode.MARKDOWN)
+        return True
+    if text == BOT_ACTION_USAGE:
+        row = db_get_bot(name)
+        await update.message.reply_text(await bot_usage_text(row))
+        return True
+    if text == BOT_ACTION_FILES:
+        row = db_get_bot(name)
+        await open_file_manager(update, d, row["path"], f"📂 ملفات {name}")
+        return True
+    if text == BOT_ACTION_SETTINGS:
+        new_state = db_toggle_autorestart(name)
+        await update.message.reply_text(
+            "✅ تم تفعيل إعادة التشغيل التلقائي." if new_state else "✅ تم تعطيل إعادة التشغيل التلقائي."
+        )
+        return True
+    if text == BOT_ACTION_RENAME:
+        d["pending"] = "bot_rename"
+        await update.message.reply_text("أرسل الاسم الجديد للبوت:")
+        return True
+    if text == BOT_ACTION_DELETE:
+        d["pending"] = "bot_confirm_delete"
+        await update.message.reply_text(f"هل أنت متأكد من حذف البوت {name} نهائياً؟", reply_markup=CONFIRM_MENU)
+        return True
+
+    return False
+
+
+# --- Pending (free-text) actions --------------------------------------------
+
+
+async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict, text: str) -> None:
+    user_id = update.effective_user.id
+    pending = d["pending"]
+
+    if pending == "bot_upload_name":
+        name = text.strip()
+        if db_get_bot(name):
+            await update.message.reply_text("⚠️ يوجد بوت بهذا الاسم بالفعل. اختر اسماً آخر:")
+            return
+        d["data"]["bot_name"] = name
+        d["pending"] = "bot_upload_file"
+        await update.message.reply_text("الآن أرسل ملف ZIP يحتوي على كود البوت:")
+        return
+
+    if pending == "bot_rename":
+        old = d["bot_selected"]
+        new = text.strip()
+        if db_get_bot(new):
+            await update.message.reply_text("⚠️ يوجد بوت بهذا الاسم بالفعل. أرسل اسماً آخر:")
+            return
+        reset_pending(d)
+        db_rename_bot(old, new)
+        d["bot_selected"] = new
+        log_action(user_id, f"renamed bot {old} -> {new}")
+        await update.message.reply_text(f"✅ تم تغيير الاسم إلى {new}.")
+        await refresh_bot_detail_message(update, new)
+        return
+
+    if pending == "bot_confirm_delete":
+        reset_pending(d)
+        if text == CONFIRM_YES:
+            name = d["bot_selected"]
+            row = db_get_bot(name)
+            stop_bot_process(name)
+            if row:
+                shutil.rmtree(row["path"], ignore_errors=True)
+            db_delete_bot(name)
+            log_action(user_id, f"delete bot {name}")
+            await update.message.reply_text(f"🗑️ تم حذف {name}.")
+        else:
+            await update.message.reply_text("تم الإلغاء.")
+        await return_to_bots_list(update, d)
+        return
+
+    if pending == "set_password":
+        reset_pending(d)
+        set_setting("panel_password", text)
+        log_action(user_id, "changed panel password")
+        await update.message.reply_text("✅ تم تغيير كلمة المرور.")
+        return
+    if pending == "add_admin":
+        reset_pending(d)
+        try:
+            uid = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ أدخل رقم ID صحيح.")
+            return
+        conn = db_connect()
+        conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (uid,))
+        conn.commit()
+        conn.close()
+        log_action(user_id, f"added admin {uid}")
+        await update.message.reply_text(f"✅ تمت إضافة {uid} كمدير.")
+        return
+    if pending == "del_admin":
+        reset_pending(d)
+        try:
+            uid = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ أدخل رقم ID صحيح.")
+            return
+        conn = db_connect()
+        conn.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        conn.commit()
+        conn.close()
+        log_action(user_id, f"removed admin {uid}")
+        await update.message.reply_text(f"✅ تم حذف {uid} من المدراء.")
+        return
+    if pending == "backup_restore":
+        reset_pending(d)
+        await restore_backup(update, text)
+        return
+    if pending == "backup_send":
+        reset_pending(d)
+        await send_backup(update, text)
+        return
+
+    # --- file manager pending inputs ---------------------------------------
+    if pending == "fm_mkdir":
+        reset_pending(d)
+        new_dir = Path(d["fm_path"]) / text.strip()
+        new_dir.mkdir(parents=True, exist_ok=True)
+        log_action(user_id, f"mkdir {new_dir}")
+        await update.message.reply_text("✅ تم إنشاء المجلد.")
+        await render_fm(update, d)
+        return
+
+    if pending == "fm_search_term":
+        reset_pending(d)
+        await fm_search(update, d, text.strip())
+        return
+
+    if pending == "fm_edit_content":
+        reset_pending(d)
+        p = Path(d["fm_selected"])
+        p.write_text(text, encoding="utf-8")
+        log_action(user_id, f"edit file {p}")
+        await update.message.reply_text("✅ تم حفظ الملف.")
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return
+
+    if pending == "fm_mkdir_in_selected":
+        reset_pending(d)
+        parent = Path(d["fm_selected"])
+        new_dir = parent / text.strip()
+        new_dir.mkdir(parents=True, exist_ok=True)
+        log_action(user_id, f"mkdir {new_dir}")
+        await update.message.reply_text("✅ تم إنشاء المجلد.")
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return
+
+    if pending == "fm_rename_new_name":
+        reset_pending(d)
+        src = Path(d["fm_selected"])
+        dst = src.parent / text.strip()
+        try:
+            src.rename(dst)
+            log_action(user_id, f"rename {src} -> {dst}")
+            await update.message.reply_text("✅ تمت إعادة التسمية.")
+        except Exception as exc:
+            await update.message.reply_text(f"❌ فشلت إعادة التسمية: {exc}")
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return
+
+    if pending == "fm_confirm_delete":
+        reset_pending(d)
+        p = Path(d["fm_selected"])
+        if text == CONFIRM_YES:
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+                log_action(user_id, f"delete {p}")
+                await update.message.reply_text(f"🗑️ تم حذف {p.name}.")
+            except Exception as exc:
+                await update.message.reply_text(f"❌ فشل الحذف: {exc}")
+        else:
+            await update.message.reply_text("تم الإلغاء.")
+        return_to_filemanager(d)
+        await render_fm(update, d)
+        return
+
+    reset_pending(d)
+    await update.message.reply_text("تم إلغاء العملية.")
+
+
+# =========================================================================
+# Document (file/bot upload) handler
+# =========================================================================
 
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     if not is_admin(user_id) or user_id not in AUTHENTICATED:
         return
-    state = get_state(user_id)
-    pending = state.get("pending")
+    d = ud(context)
+    pending = d.get("pending")
     doc = update.message.document
 
     if doc.file_size and doc.file_size > config.MAX_FILE_SIZE:
         await update.message.reply_text("❌ الملف أكبر من الحد المسموح.")
         return
 
-    if pending == "file_upload_file":
-        reset_pending(user_id)
-        dest_dir = Path(state["data"]["upload_dir"])
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / doc.file_name
+    if pending == "fm_upload_file":
+        reset_pending(d)
+        dest = Path(d["fm_path"]) / doc.file_name
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(str(dest))
         log_action(user_id, f"upload file {dest}")
         await update.message.reply_text(f"✅ تم رفع {doc.file_name}.")
+        await render_fm(update, d)
+        return
+
+    if pending == "fm_upload_into_selected":
+        reset_pending(d)
+        parent = Path(d["fm_selected"])
+        dest = parent / doc.file_name
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(str(dest))
+        log_action(user_id, f"upload file {dest}")
+        await update.message.reply_text(f"✅ تم رفع {doc.file_name} داخل {parent.name}.")
+        return_to_filemanager(d)
+        await render_fm(update, d)
         return
 
     if pending == "bot_upload_file":
-        reset_pending(user_id)
-        name = state["data"]["bot_name"]
+        reset_pending(d)
+        name = d["data"]["bot_name"]
         bot_dir = Path(config.BOTS_DIR) / name
         bot_dir.mkdir(parents=True, exist_ok=True)
         zip_dest = bot_dir / "upload.zip"
@@ -1367,7 +2101,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         log_action(user_id, f"uploaded bot {name} ({runtime})")
         await update.message.reply_text(f"📦 تم استلام {name} كمشروع {runtime}. جاري تثبيت المتطلبات...")
         result = install_requirements(bot_dir, runtime)
-        await update.message.reply_text(f"✅ تم إعداد البوت.\n```\n{trim(result)}\n```", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"✅ تم إعداد البوت.\n```\n{result[-1500:]}\n```", parse_mode=ParseMode.MARKDOWN)
+        await open_bots_menu(update, d)
         return
 
 
@@ -1384,7 +2119,7 @@ def main() -> None:
 
     db_init()
 
-    app = Application.builder().token(config.BOT_TOKEN).build()
+    app = Application.builder().token(config.BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
