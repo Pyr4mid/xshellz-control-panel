@@ -13,7 +13,7 @@ BOT_TOKEN: str = "8933297746:AAEECEnJsqKSATbowWpu80i04oRZ2wdUt-o"
 
 # Your numeric Telegram user ID (get it from @userinfobot). Only this user
 # (plus any admins added later from inside the bot) can use the panel.
-OWNER_ID: int = 0
+OWNER_ID: int = 7770180834
 
 # Default control-panel password. Can be changed later from the Settings
 # menu (the new password is stored in the database, this value is only
