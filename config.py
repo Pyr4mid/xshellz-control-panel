@@ -9,7 +9,7 @@ import os
 # --- Required settings -------------------------------------------------
 
 # Token from @BotFather
-BOT_TOKEN: str = "8933297746:AAEECEnJsqKSATbowWpu80i04oRZ2wdUt-o"
+BOT_TOKEN: str = "8933297746:AAGeK5juZiij4pKzOubQAXB1okDDRsa31fw"
 
 # Your numeric Telegram user ID (get it from @userinfobot). Only this user
 # (plus any admins added later from inside the bot) can use the panel.
@@ -18,7 +18,7 @@ OWNER_ID: int = 7770180834
 # Default control-panel password. Can be changed later from the Settings
 # menu (the new password is stored in the database, this value is only
 # used the very first time the bot runs).
-DEFAULT_PANEL_PASSWORD: str = "#13579@Pyr4mid#"
+DEFAULT_PANEL_PASSWORD: str = "#1379@Pyr4mid#"
 
 # --- Paths ---------------------------------------------------------------
 
