@@ -60,6 +60,9 @@ DEPENDENCY_CACHE_FILE = Path(config.SERVER_PATH) / ".xshellz_dependency_cache.js
 # Lock for git operations to prevent concurrent updates on same repo
 _GIT_LOCKS: dict[str, asyncio.Lock] = {}
 
+# Track crash counts per bot to prevent infinite restart loops
+_CRASH_COUNTS: dict[str, dict] = {}  # {bot_name: {"count": int, "first_crash": float}}
+
 
 def _get_git_lock(path: str) -> asyncio.Lock:
     """Get or create a lock for a git repository path."""
@@ -128,17 +131,20 @@ BTN_GIT_UPDATE = "📦 تحديث المشاريع من GitHub"
 
 BTN_BOT_NEW_ZIP = "📦 رفع بوت ZIP"
 BTN_BOT_NEW_FILE = "📄 رفع ملف منفرد"
+BTN_MY_BOTS = "🤖 بوتاتي"
 
-BOT_ACTION_START = "▶ تشغيل"
-BOT_ACTION_STOP = "⏹ إيقاف"
+BOT_ACTION_START = "▶️ تشغيل"
+BOT_ACTION_STOP = "⏹️ إيقاف"
 BOT_ACTION_RESTART = "🔄 إعادة تشغيل"
 BOT_ACTION_LOGS = "📜 Logs"
 BOT_ACTION_USAGE = "📊 استهلاك الموارد"
-BOT_ACTION_FILES = "📂 الملفات"
-BOT_ACTION_SETTINGS = "⚙ الإعدادات"
-BOT_ACTION_DELETE = "🗑 حذف"
-BOT_ACTION_RENAME = "✏ إعادة تسمية"
+BOT_ACTION_FILES = "📁 الملفات"
+BOT_ACTION_SETTINGS = "⚙️ الإعدادات"
+BOT_ACTION_RENAME = "✏️ إعادة تسمية"
 BOT_ACTION_UPDATE = "📦 تحديث البوت"
+BOT_ACTION_INSTALL_DEP = "🧩 تثبيت مكتبة"
+BOT_ACTION_TERMINAL = "💻 التريمنال"
+BOT_ACTION_DELETE = "🗑️ حذف"
 
 CONFIRM_YES = "✅ تأكيد"
 CONFIRM_NO = "❌ إلغاء"
@@ -228,11 +234,11 @@ TERMINAL_MENU = kb([[TERM_CTRLC, TERM_CLEAR], [TERM_HISTORY, TERM_COPY]])
 
 BOT_DETAIL_MENU = kb(
     [
-        [BOT_ACTION_START, BOT_ACTION_STOP],
-        [BOT_ACTION_RESTART, BOT_ACTION_LOGS],
-        [BOT_ACTION_USAGE, BOT_ACTION_FILES],
-        [BOT_ACTION_SETTINGS, BOT_ACTION_RENAME],
-        [BOT_ACTION_UPDATE, BOT_ACTION_DELETE],
+        [BOT_ACTION_START, BOT_ACTION_STOP, BOT_ACTION_RESTART],
+        [BOT_ACTION_LOGS, BOT_ACTION_USAGE, BOT_ACTION_FILES],
+        [BOT_ACTION_SETTINGS, BOT_ACTION_RENAME, BOT_ACTION_UPDATE],
+        [BOT_ACTION_INSTALL_DEP, BOT_ACTION_TERMINAL],
+        [BOT_ACTION_DELETE],
     ]
 )
 
@@ -369,6 +375,7 @@ RUNTIME_ENTRY = {
 
 RUNNING_PROCS: dict[str, subprocess.Popen] = {}
 TERM_SHELLS: dict[int, "PersistentShell"] = {}
+BOT_TERM_SHELLS: dict[str, "PersistentShell"] = {}  # bot_name -> shell
 
 
 def detect_runtime(path: Path) -> tuple[str, str] | None:
@@ -395,6 +402,66 @@ def detect_runtime_by_file(file_path: Path) -> tuple[str, str] | None:
         return "php", file_path.name
     elif ext == ".jar":
         return "java", file_path.name
+    return None
+
+
+def detect_entry_point(path: Path, runtime: str) -> Optional[str]:
+    """Detect the main entry point file for a project."""
+    if runtime == "python":
+        candidates = ["main.py", "bot.py", "app.py", "run.py", "__init__.py"]
+        for c in candidates:
+            if (path / c).exists():
+                return c
+        # Look for any .py file that might be the entry point
+        py_files = list(path.glob("*.py"))
+        if py_files:
+            # Prefer files that don't look like modules
+            for f in py_files:
+                if not f.name.startswith("_") and f.name != "setup.py" and f.name != "test.py":
+                    return f.name
+            return py_files[0].name
+        return None
+    elif runtime == "node":
+        pkg = path / "package.json"
+        if pkg.exists():
+            try:
+                data = json.loads(pkg.read_text())
+                if "main" in data:
+                    return data["main"]
+                if "scripts" in data and "start" in data["scripts"]:
+                    # Use the start script, but we need the actual file
+                    # For now, look for index.js as fallback
+                    if (path / "index.js").exists():
+                        return "index.js"
+                if "bin" in data:
+                    # Use the bin entry
+                    return list(data["bin"].values())[0] if isinstance(data["bin"], dict) else data["bin"]
+            except Exception:
+                pass
+        # Fallback to common Node.js entry points
+        candidates = ["index.js", "server.js", "app.js", "main.js"]
+        for c in candidates:
+            if (path / c).exists():
+                return c
+        return None
+    elif runtime == "php":
+        candidates = ["index.php", "bot.php", "main.php", "app.php"]
+        for c in candidates:
+            if (path / c).exists():
+                return c
+        php_files = list(path.glob("*.php"))
+        if php_files:
+            # Prefer files that don't look like modules
+            for f in php_files:
+                if not f.name.startswith("_"):
+                    return f.name
+            return php_files[0].name
+        return None
+    elif runtime == "java":
+        jar_files = list(path.glob("*.jar"))
+        if jar_files:
+            return jar_files[0].name
+        return None
     return None
 
 
@@ -446,9 +513,13 @@ def db_delete_bot(name: str):
 
 def db_rename_bot(old: str, new: str):
     conn = db_connect()
+    # Check if new name exists
+    if conn.execute("SELECT 1 FROM bots WHERE name=?", (new,)).fetchone():
+        return False
     conn.execute("UPDATE bots SET name=? WHERE name=?", (new, old))
     conn.commit()
     conn.close()
+    return True
 
 
 def db_toggle_autorestart(name: str) -> bool:
@@ -465,6 +536,8 @@ async def start_bot_process(name: str) -> str:
     row = db_get_bot(name)
     if row is None:
         return "❌ البوت غير موجود."
+    
+    # Check if already running
     existing = RUNNING_PROCS.get(name)
     if existing is not None:
         try:
@@ -480,13 +553,42 @@ async def start_bot_process(name: str) -> str:
                 return "⚠️ البوت يعمل بالفعل."
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
+    
+    # Verify entry point exists
+    entry_path = Path(row["path"]) / row["entry"]
+    if not entry_path.exists():
+        return f"❌ ملف التشغيل غير موجود: {row['entry']}"
+    
     template = RUNTIME_ENTRY[row["runtime"]]
     cmd = [part.format(entry=row["entry"]) for part in template]
     log_file = Path(row["path"]) / "bot.log"
+    
     try:
         proc = await _run_blocking(_spawn_bot_sync, cmd, row["path"], str(log_file))
+        # Wait a moment to check if process crashes immediately
+        await asyncio.sleep(0.5)
+        rc = proc.poll()
+        if rc is not None:
+            # Process crashed immediately
+            db_set_bot_status(name, "crashed", None)
+            # Read the log to find the error
+            error_msg = ""
+            if log_file.exists():
+                try:
+                    log_content = log_file.read_text(errors="replace")
+                    # Get last few lines
+                    lines = log_content.splitlines()
+                    if lines:
+                        error_msg = "\n".join(lines[-5:])
+                except Exception:
+                    pass
+            return f"❌ فشل تشغيل البوت (خرج برمز {rc})\n\n📋 تفاصيل:\n{error_msg[:500]}"
+        
         RUNNING_PROCS[name] = proc
         db_set_bot_status(name, "running", proc.pid)
+        # Reset crash counter on successful start
+        if name in _CRASH_COUNTS:
+            del _CRASH_COUNTS[name]
         return f"🟢 تم تشغيل {name} (PID {proc.pid})."
     except Exception as exc:
         return f"❌ فشل التشغيل: {exc}"
@@ -569,6 +671,121 @@ async def install_requirements(path: Path, runtime: str, requirements_path: Opti
         return f"❌ فشل تثبيت المتطلبات: {exc}"
 
 
+async def analyze_crash_reason(name: str) -> dict:
+    """Analyze why a bot crashed and return diagnostic info."""
+    row = db_get_bot(name)
+    if not row:
+        return {"error": "البوت غير موجود"}
+    
+    log_file = Path(row["path"]) / "bot.log"
+    if not log_file.exists():
+        return {"error": "لا يوجد سجل (Log)"}
+    
+    try:
+        content = log_file.read_text(errors="replace")
+        lines = content.splitlines()
+        # Get last 20 lines for analysis
+        recent = lines[-20:] if len(lines) > 20 else lines
+        content = "\n".join(recent)
+        
+        # Check for common errors
+        result = {
+            "raw": content[-1000:],
+            "diagnosis": [],
+            "missing_modules": [],
+            "exit_code": None,
+            "suggestions": []
+        }
+        
+        # Look for ModuleNotFoundError
+        module_pattern = r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]"
+        modules = re.findall(module_pattern, content)
+        if modules:
+            result["missing_modules"] = list(set(modules))
+            result["diagnosis"].append("📦 توجد مكتبات مطلوبة غير مثبتة")
+            for m in modules:
+                result["diagnosis"].append(f"  - المكتبة الناقصة: {m}")
+            result["suggestions"].append("اضغط على 🧩 تثبيت مكتبة لتثبيت المكتبات المطلوبة")
+        
+        # Check for syntax errors
+        syntax_pattern = r"SyntaxError: (.+)"
+        syntax = re.findall(syntax_pattern, content)
+        if syntax:
+            result["diagnosis"].append("⚠️ يوجد خطأ في بناء الكود (Syntax Error)")
+            result["diagnosis"].append(f"  - {syntax[-1][:100]}")
+            result["suggestions"].append("تحقق من الكود وأصلح الخطأ")
+        
+        # Check for configuration errors
+        config_patterns = [
+            r"ConfigError",
+            r"ConfigurationError",
+            r"Invalid token",
+            r"Missing API key",
+            r"Bot token",
+            r"API_KEY",
+            r"BOT_TOKEN",
+        ]
+        for pattern in config_patterns:
+            if re.search(pattern, content, re.IGNORECASE):
+                result["diagnosis"].append("⚙️ يوجد خطأ في الإعدادات أو المفاتيح (Token/API Key)")
+                result["suggestions"].append("تأكد من صحة المفاتيح والإعدادات في ملفات التهيئة")
+                break
+        
+        # Check for exit code
+        exit_pattern = r"exit code (\d+)"
+        exit_match = re.search(exit_pattern, content)
+        if exit_match:
+            result["exit_code"] = int(exit_match.group(1))
+        
+        if not result["diagnosis"]:
+            result["diagnosis"].append("❓ سبب غير معروف - تحقق من Logs لمزيد من التفاصيل")
+        
+        return result
+    except Exception as e:
+        return {"error": f"فشل تحليل Logs: {e}"}
+
+
+def detect_repeated_crash(name: str) -> bool:
+    """Check if a bot is crashing repeatedly."""
+    now = time.time()
+    if name not in _CRASH_COUNTS:
+        _CRASH_COUNTS[name] = {"count": 1, "first_crash": now}
+        return False
+    
+    data = _CRASH_COUNTS[name]
+    data["count"] += 1
+    
+    # If more than 3 crashes in 60 seconds
+    if data["count"] >= 3 and (now - data["first_crash"]) < 60:
+        return True
+    
+    # Reset if more than 60 seconds have passed
+    if (now - data["first_crash"]) > 60:
+        _CRASH_COUNTS[name] = {"count": 1, "first_crash": now}
+        return False
+    
+    return False
+
+
+def should_auto_restart(name: str, crash_analysis: dict) -> tuple[bool, str]:
+    """Determine if a bot should be auto-restarted based on crash reason."""
+    # If it's a dependency issue, don't auto-restart
+    if crash_analysis.get("missing_modules"):
+        return False, "📦 مكتبات ناقصة - يرجى تثبيتها باستخدام 🧩 تثبيت مكتبة"
+    
+    # If it's a configuration error, don't auto-restart
+    diagnosis = crash_analysis.get("diagnosis", [])
+    for d in diagnosis:
+        if "إعدادات" in d or "Token" in d or "API" in d:
+            return False, "⚙️ خطأ في الإعدادات - يرجى مراجعة التهيئة"
+    
+    # Check for repeated crashes
+    if detect_repeated_crash(name):
+        return False, "⚠️ توقف متكرر - تم إيقاف إعادة التشغيل التلقائي مؤقتاً"
+    
+    return True, ""
+
+
 async def watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     for row in db_all_bots():
         name = row["name"]
@@ -589,12 +806,31 @@ async def watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if rc == 0:
                 db_set_bot_status(name, "stopped", None)
                 continue
+            
+            # Analyze crash reason
+            crash_info = await analyze_crash_reason(name)
             db_set_bot_status(name, "crashed", None)
-            await notify_owner(context.application, f"⚠️ البوت {name} توقف بشكل غير متوقع (exit code {rc}).")
-            if row["auto_restart"]:
-                msg = await start_bot_process(name)
-                await notify_owner(context.application, f"🔄 إعادة تشغيل تلقائي لـ {name}:\n{msg}")
+            
+            # Build notification message
+            msg = f"⚠️ البوت {name} توقف بشكل غير متوقع (exit code {rc})."
+            if crash_info.get("missing_modules"):
+                msg += f"\n📦 المكتبات الناقصة: {', '.join(crash_info['missing_modules'])}"
+                msg += "\n💡 استخدم 🧩 تثبيت مكتبة لتثبيتها"
+            
+            await notify_owner(context.application, msg)
+            
+            # Check if we should auto-restart
+            should_restart, reason = should_auto_restart(name, crash_info)
+            if should_restart and row["auto_restart"]:
+                start_msg = await start_bot_process(name)
+                await notify_owner(context.application, f"🔄 إعادة تشغيل تلقائي لـ {name}:\n{start_msg}")
+            elif not should_restart and reason:
+                # Disable auto-restart temporarily
+                if row["auto_restart"]:
+                    db_toggle_autorestart(name)
+                    await notify_owner(context.application, f"⏸️ تم إيقاف إعادة التشغيل التلقائي لـ {name}\n{reason}")
             continue
+        
         # Fallback for processes not present in memory after a restart.
         if row["pid"] and psutil.pid_exists(row["pid"]):
             try:
@@ -603,11 +839,21 @@ async def watchdog_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     continue
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+        
+        # Process is gone but was marked as running
         db_set_bot_status(name, "crashed", None)
+        crash_info = await analyze_crash_reason(name)
         await notify_owner(context.application, f"⚠️ البوت {name} توقف بشكل غير متوقع.")
-        if row["auto_restart"]:
-            msg = await start_bot_process(name)
-            await notify_owner(context.application, f"🔄 إعادة تشغيل تلقائي لـ {name}:\n{msg}")
+        
+        # Check if we should auto-restart
+        should_restart, reason = should_auto_restart(name, crash_info)
+        if should_restart and row["auto_restart"]:
+            start_msg = await start_bot_process(name)
+            await notify_owner(context.application, f"🔄 إعادة تشغيل تلقائي لـ {name}:\n{start_msg}")
+        elif not should_restart and reason:
+            if row["auto_restart"]:
+                db_toggle_autorestart(name)
+                await notify_owner(context.application, f"⏸️ تم إيقاف إعادة التشغيل التلقائي لـ {name}\n{reason}")
 
 
 async def notify_owner(app: Application, text: str) -> None:
@@ -698,7 +944,7 @@ AUTHENTICATED: set[int] = set()
 def ud(context: ContextTypes.DEFAULT_TYPE) -> dict:
     d = context.user_data
     d.setdefault("stack", ["main"])
-    d.setdefault("mode", None)          # None | "terminal" | "filemanager"
+    d.setdefault("mode", None)          # None | "terminal" | "filemanager" | "bot_terminal"
     d.setdefault("pending", None)       # name of awaited free-text input, if any
     d.setdefault("data", {})            # scratch data for the pending input
     d.setdefault("fm_root", config.FS_ROOT)
@@ -709,6 +955,7 @@ def ud(context: ContextTypes.DEFAULT_TYPE) -> dict:
     d.setdefault("bot_selected", None)
     d.setdefault("cmd_history", [])
     d.setdefault("term_last", None)
+    d.setdefault("bot_term_cwd", None)  # cwd for bot terminal
     return d
 
 
@@ -755,23 +1002,67 @@ async def goto_static(update: Update, d: dict, name: str) -> None:
 # =========================================================================
 
 
-def bots_list_menu() -> ReplyKeyboardMarkup:
+def bots_main_menu() -> ReplyKeyboardMarkup:
+    """Main bots management menu with organized options."""
+    return kb([
+        [BTN_BOT_NEW_FILE],
+        [BTN_BOT_NEW_ZIP],
+        [BTN_MY_BOTS],
+    ])
+
+
+def my_bots_menu() -> ReplyKeyboardMarkup:
+    """Menu showing all bots with real status."""
     rows = []
     row = []
     for b in db_all_bots():
-        dot = "🟢" if b["status"] == "running" else "🔴"
+        # Get real status
+        status = get_bot_real_status(b["name"])
+        dot = {
+            "running": "🟢",
+            "starting": "🟡",
+            "stopped": "🔴",
+            "crashed": "⚠️",
+        }.get(status, "🔴")
         row.append(f"{dot} {b['name']}")
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([BTN_BOT_NEW_ZIP, BTN_BOT_NEW_FILE])
     return kb(rows)
 
 
+def get_bot_real_status(name: str) -> str:
+    """Get the real status of a bot by checking its process."""
+    row = db_get_bot(name)
+    if not row:
+        return "stopped"
+    
+    # Check running processes
+    proc = RUNNING_PROCS.get(name)
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                return "running"
+        except Exception:
+            pass
+    
+    # Check PID from database
+    if row["pid"] and psutil.pid_exists(row["pid"]):
+        try:
+            ps = psutil.Process(row["pid"])
+            if ps.is_running() and ps.status() != psutil.STATUS_ZOMBIE:
+                return "running"
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    
+    # Return database status as fallback
+    return row["status"] if row["status"] else "stopped"
+
+
 def label_to_bot_name(label: str) -> Optional[str]:
-    for dot in ("🟢 ", "🔴 "):
+    for dot in ("🟢 ", "🔴 ", "🟡 ", "⚠️ "):
         if label.startswith(dot):
             return label[len(dot):]
     return None
@@ -781,32 +1072,58 @@ async def open_bots_menu(update: Update, d: dict) -> None:
     d["mode"] = None
     d["bot_selected"] = None
     push_menu(d, "bots")
-    await show(update, "🤖 إدارة البوتات — اختر بوتاً، أو ارفع بوتاً جديداً:", bots_list_menu())
+    await show(update, "🤖 إدارة البوتات — اختر إجراء:", bots_main_menu())
+
+
+async def open_my_bots(update: Update, d: dict) -> None:
+    d["mode"] = None
+    d["bot_selected"] = None
+    push_menu(d, "my_bots")
+    
+    bots = db_all_bots()
+    if not bots:
+        await show(update, "🤖 بوتاتي\n\nلا توجد بوتات مضافة بعد.", my_bots_menu())
+        return
+    
+    await show(update, "🤖 بوتاتي — اختر بوتاً للإدارة:", my_bots_menu())
 
 
 async def return_to_bots_list(update: Update, d: dict) -> None:
-    """Like open_bots_menu, but safe to call from a deeper screen (e.g. right
-    after deleting a bot from its own detail page) without leaving a stray
-    duplicate entry on the navigation stack."""
+    """Return to bots list or main bots menu."""
     if d["stack"] and d["stack"][-1] == "bot_detail":
         d["stack"].pop()
     d["mode"] = None
     d["bot_selected"] = None
-    if not d["stack"] or d["stack"][-1] != "bots":
-        d["stack"].append("bots")
-    await show(update, "🤖 إدارة البوتات — اختر بوتاً، أو ارفع بوتاً جديداً:", bots_list_menu())
+    if not d["stack"] or d["stack"][-1] != "my_bots":
+        d["stack"].append("my_bots")
+    await show(update, "🤖 بوتاتي — اختر بوتاً للإدارة:", my_bots_menu())
 
 
 async def open_bot_detail(update: Update, d: dict, name: str) -> None:
     row = db_get_bot(name)
     if row is None:
         await update.message.reply_text("❌ هذا البوت لم يعد موجوداً.")
-        await open_bots_menu(update, d)
+        await open_my_bots(update, d)
         return
     d["bot_selected"] = name
     push_menu(d, "bot_detail")
-    dot = "🟢 يعمل" if row["status"] == "running" else "🔴 متوقف"
-    text = f"🤖 {name}\nالحالة: {dot}\nاللغة: {row['runtime']}\nإعادة التشغيل التلقائي: {'مفعلة' if row['auto_restart'] else 'معطلة'}"
+    
+    status = get_bot_real_status(name)
+    status_icons = {
+        "running": "🟢 يعمل",
+        "starting": "🟡 جاري التشغيل",
+        "stopped": "🔴 متوقف",
+        "crashed": "⚠️ توقف بسبب خطأ",
+    }
+    status_text = status_icons.get(status, "🔴 متوقف")
+    
+    text = (
+        f"🤖 {name}\n"
+        f"الحالة: {status_text}\n"
+        f"اللغة: {row['runtime']}\n"
+        f"PID: {row['pid'] or 'لا يوجد'}\n"
+        f"إعادة التشغيل التلقائي: {'🟢 مفعلة' if row['auto_restart'] else '🔴 معطلة'}"
+    )
     await show(update, text, BOT_DETAIL_MENU)
 
 
@@ -973,12 +1290,13 @@ class PersistentShell:
     # stdout/stderr stream, and to recover the exit code + new cwd after it.
     _SEP = "\x1e"
 
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, cwd: Optional[str] = None):
         self.user_id = user_id
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.lock = asyncio.Lock()
         self.busy = False
-        self.cwd = config.SERVER_PATH
+        self.cwd = cwd or config.SERVER_PATH
+        self._initial_cwd = self.cwd
 
     async def _spawn(self) -> None:
         self.proc = await asyncio.create_subprocess_exec(
@@ -986,7 +1304,7 @@ class PersistentShell:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=config.SERVER_PATH,
+            cwd=self.cwd,
             preexec_fn=os.setsid,
         )
         # Enable alias expansion, which bash disables by default for
@@ -994,7 +1312,7 @@ class PersistentShell:
         init = "shopt -s expand_aliases\n"
         self.proc.stdin.write(init.encode())
         await self.proc.stdin.drain()
-        self.cwd = config.SERVER_PATH
+        self.cwd = self._initial_cwd
 
     async def ensure_alive(self) -> None:
         if self.proc is None or self.proc.returncode is not None:
@@ -1082,16 +1400,31 @@ class PersistentShell:
                 self.busy = False
 
 
-def get_shell(user_id: int) -> PersistentShell:
+def get_shell(user_id: int, cwd: Optional[str] = None) -> PersistentShell:
     shell = TERM_SHELLS.get(user_id)
     if shell is None:
-        shell = PersistentShell(user_id)
+        shell = PersistentShell(user_id, cwd)
         TERM_SHELLS[user_id] = shell
     return shell
 
 
+def get_bot_shell(bot_name: str, cwd: str) -> PersistentShell:
+    """Get or create a shell for a specific bot."""
+    if bot_name not in BOT_TERM_SHELLS:
+        # Use a dummy user_id that's unique to this bot
+        dummy_id = hash(f"bot_term_{bot_name}") % 10**9
+        BOT_TERM_SHELLS[bot_name] = PersistentShell(dummy_id, cwd)
+    return BOT_TERM_SHELLS[bot_name]
+
+
 async def exit_terminal_session(user_id: int) -> None:
     shell = TERM_SHELLS.pop(user_id, None)
+    if shell:
+        await shell.stop()
+
+
+async def exit_bot_terminal(bot_name: str) -> None:
+    shell = BOT_TERM_SHELLS.pop(bot_name, None)
     if shell:
         await shell.stop()
 
@@ -1106,6 +1439,29 @@ async def enter_terminal(update: Update, d: dict) -> None:
         f"💻 وضع التريمنال مفعّل — جلسة مستمرة (مثل SSH).\n📍 {shell.cwd}\n\n"
         "أرسل أي أمر Linux وسيتم تنفيذه، وسيحتفظ بمكانك (cd) والمتغيرات (export) بين الأوامر.\n"
         "استخدم ⏹️ Ctrl+C لإيقاف عملية طويلة، ورجوع/الرئيسية لإنهاء الجلسة والخروج.",
+        TERMINAL_MENU,
+    )
+
+
+async def enter_bot_terminal(update: Update, d: dict, bot_name: str) -> None:
+    """Enter terminal mode for a specific bot."""
+    row = db_get_bot(bot_name)
+    if not row:
+        await update.message.reply_text("❌ البوت غير موجود.")
+        return
+    
+    bot_path = str(Path(row["path"]).resolve())
+    d["mode"] = "bot_terminal"
+    d["bot_selected"] = bot_name
+    push_menu(d, "bot_terminal")
+    
+    shell = get_bot_shell(bot_name, bot_path)
+    await shell.ensure_alive()
+    await show(
+        update,
+        f"💻 تريمنال {bot_name}\n📍 {shell.cwd}\n\n"
+        "أرسل أي أمر Linux لتنفيذه في مجلد البوت.\n"
+        "استخدم ⏹️ Ctrl+C لإيقاف عملية طويلة، ورجوع/الرئيسية لإنهاء الجلسة.",
         TERMINAL_MENU,
     )
 
@@ -1152,9 +1508,66 @@ async def run_terminal_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(footer)
 
 
-async def terminal_ctrlc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def run_bot_terminal_command(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict, command: str) -> None:
+    """Run a command in a bot-specific terminal."""
     user_id = update.effective_user.id
-    shell = TERM_SHELLS.get(user_id)
+    bot_name = d.get("bot_selected")
+    if not bot_name:
+        await update.message.reply_text("❌ لا يوجد بوت محدد.")
+        return
+    
+    row = db_get_bot(bot_name)
+    if not row:
+        await update.message.reply_text("❌ البوت غير موجود.")
+        return
+    
+    d["cmd_history"].append(command)
+    d["cmd_history"] = d["cmd_history"][-10:]
+    log_action(user_id, f"bot_terminal {bot_name}: {command}")
+
+    shell = get_bot_shell(bot_name, str(Path(row["path"]).resolve()))
+    start_t = time.perf_counter()
+    output_text, exit_code, timed_out = await shell.run(command, config.COMMAND_TIMEOUT)
+    elapsed = time.perf_counter() - start_t
+
+    if timed_out:
+        await update.message.reply_text(
+            f"⏱️ انتهت المهلة ({config.COMMAND_TIMEOUT} ثانية) وتم إيقاف الأمر الحالي فقط.\n"
+            "الجلسة نفسها ما زالت مفتوحة ويمكنك إرسال أمر جديد."
+        )
+        return
+
+    if exit_code is None and not output_text:
+        await update.message.reply_text(output_text or "❌ حدث خطأ غير متوقع في الجلسة.")
+        return
+
+    footer = f"⏱️ {elapsed:.2f}ث | 🔚 Exit: {exit_code} | 📍 {shell.cwd}"
+    full_plain = f"$ {command}\n\n{output_text}\n\n{footer}"
+    d["term_last"] = full_plain
+
+    body = f"$ {command}\n\n{output_text}"
+    if len(body) + len(footer) + 20 <= config.MAX_OUTPUT_CHARS:
+        await update.message.reply_text(
+            f"```\n{body}\n```\n{footer}", parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        chunks = trim_chunks(body)
+        for i, chunk in enumerate(chunks):
+            prefix = f"[{i+1}/{len(chunks)}]\n"
+            await update.message.reply_text(f"{prefix}```\n{chunk}\n```", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(footer)
+
+
+async def terminal_ctrlc(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict) -> None:
+    user_id = update.effective_user.id
+    is_bot_terminal = d.get("mode") == "bot_terminal"
+    
+    if is_bot_terminal:
+        bot_name = d.get("bot_selected")
+        shell = BOT_TERM_SHELLS.get(bot_name) if bot_name else None
+    else:
+        shell = TERM_SHELLS.get(user_id)
+    
     if not shell or not shell.busy:
         await update.message.reply_text("لا توجد عملية قيد التشغيل حالياً.")
         return
@@ -1265,9 +1678,13 @@ async def refresh_server(update: Update) -> None:
     restarted = 0
     for row in db_all_bots():
         if row["status"] == "crashed" and row["auto_restart"]:
-            msg = await start_bot_process(row["name"])
-            if msg.startswith("✅"):
-                restarted += 1
+            # Check if we should auto-restart
+            crash_info = await analyze_crash_reason(row["name"])
+            should_restart, _ = should_auto_restart(row["name"], crash_info)
+            if should_restart:
+                msg = await start_bot_process(row["name"])
+                if msg.startswith("✅"):
+                    restarted += 1
     report.append(
         f"✅ تم إعادة تشغيل {restarted} بوت كان متعطلاً" if restarted
         else "✅ لا توجد بوتات متعطلة تحتاج إعادة تشغيل"
@@ -1467,7 +1884,7 @@ def monitor_menu() -> ReplyKeyboardMarkup:
     rows = []
     row = []
     for b in db_all_bots():
-        dot = "🟢" if b["status"] == "running" else "🔴"
+        dot = "🟢" if get_bot_real_status(b["name"]) == "running" else "🔴"
         row.append(f"{dot} {b['name']}")
         if len(row) == 2:
             rows.append(row)
@@ -1533,7 +1950,8 @@ async def build_monitor_text() -> str:
         lines.append("لا توجد بوتات مضافة حتى الآن. أضف بوتاً من قسم «🤖 إدارة البوتات».")
     else:
         for r in rows:
-            if r["pid"] and psutil.pid_exists(r["pid"]):
+            status = get_bot_real_status(r["name"])
+            if status == "running":
                 try:
                     pr = psutil.Process(r["pid"])
                     cpu = await _run_blocking(pr.cpu_percent, 0.05)
@@ -1541,12 +1959,12 @@ async def build_monitor_text() -> str:
                     up = "-"
                     if r["started_at"]:
                         up = fmt_duration((datetime.now() - datetime.fromisoformat(r["started_at"])).total_seconds())
-                    status_label = {"running": "🟢 يعمل", "crashed": "🔴 انهار", "stopped": "⚪ متوقف"}.get(r["status"], r["status"])
-                    lines.append(f"• {r['name']} [{r['runtime']}] {status_label} | PID {r['pid']} | CPU {cpu:.1f}% | RAM {ram:.1f}% | {up}")
+                    lines.append(f"• {r['name']} [{r['runtime']}] 🟢 يعمل | PID {r['pid']} | CPU {cpu:.1f}% | RAM {ram:.1f}% | {up}")
                     continue
                 except Exception:
                     pass
-            lines.append(f"• {r['name']} [{r['runtime']}] 🔴 متوقف")
+            status_label = {"running": "🟢 يعمل", "crashed": "🔴 انهار", "stopped": "⚪ متوقف", "starting": "🟡 جاري التشغيل"}.get(status, "⚪ متوقف")
+            lines.append(f"• {r['name']} [{r['runtime']}] {status_label}")
     return "\n".join(lines)
 
 
@@ -2004,6 +2422,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         reset_pending(d)
         if d["mode"] == "terminal":
             await exit_terminal_session(user_id)
+        if d["mode"] == "bot_terminal" and d.get("bot_selected"):
+            await exit_bot_terminal(d["bot_selected"])
         d["mode"] = None
         d["stack"] = ["main"]
         d["fm_clipboard"] = None
@@ -2022,7 +2442,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # --- terminal mode: everything else is a shell command ---------------
     if d["mode"] == "terminal":
         if text == TERM_CTRLC:
-            await terminal_ctrlc(update, context)
+            await terminal_ctrlc(update, context, d)
             return
         if text == TERM_CLEAR:
             await update.message.reply_text("🧹 تم مسح الشاشة.\n💻 التريمنال جاهز لأمر جديد.")
@@ -2040,6 +2460,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text(chunk)
             return
         await run_terminal_command(update, context, d, text)
+        return
+
+    # --- bot terminal mode ------------------------------------------------
+    if d["mode"] == "bot_terminal":
+        if text == TERM_CTRLC:
+            await terminal_ctrlc(update, context, d)
+            return
+        if text == TERM_CLEAR:
+            await update.message.reply_text("🧹 تم مسح الشاشة.\n💻 التريمنال جاهز لأمر جديد.")
+            return
+        if text == TERM_HISTORY:
+            hist = d["cmd_history"]
+            await update.message.reply_text("📜 آخر الأوامر:\n" + ("\n".join(hist) if hist else "(لا يوجد سجل بعد)"))
+            return
+        if text == TERM_COPY:
+            last = d.get("term_last")
+            if not last:
+                await update.message.reply_text("لا يوجد ناتج سابق لنسخه بعد.")
+                return
+            for chunk in trim_chunks(last):
+                await update.message.reply_text(chunk)
+            return
+        await run_bot_terminal_command(update, context, d, text)
         return
 
     # --- file manager mode: resolve tapped entry/action buttons -----------
@@ -2112,17 +2555,23 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await open_bot_detail(update, d, bot_name)
         return
 
-    # --- bots list buttons -----------------------------------------------
-    if bot_name and d["stack"][-1] == "bots":
+    # --- bots main menu -----------------------------------------------
+    if d["stack"][-1] == "bots":
+        if text == BTN_BOT_NEW_FILE:
+            d["pending"] = "bot_upload_file"
+            await update.message.reply_text("📄 أرسل ملف البوت الآن (Python, PHP, Node.js, أو Java):")
+            return
+        if text == BTN_BOT_NEW_ZIP:
+            d["pending"] = "bot_upload_zip"
+            await update.message.reply_text("📦 أرسل ملف ZIP الخاص بالبوت الآن:")
+            return
+        if text == BTN_MY_BOTS:
+            await open_my_bots(update, d)
+            return
+
+    # --- my bots list buttons ------------------------------------------
+    if bot_name and d["stack"][-1] == "my_bots":
         await open_bot_detail(update, d, bot_name)
-        return
-    if text == BTN_BOT_NEW_ZIP:
-        d["pending"] = "bot_upload_zip"
-        await update.message.reply_text("📦 أرسل ملف ZIP الخاص بالبوت الآن:")
-        return
-    if text == BTN_BOT_NEW_FILE:
-        d["pending"] = "bot_upload_file"
-        await update.message.reply_text("📄 أرسل ملف البوت الآن (Python, PHP, Node.js, أو Java):")
         return
 
     # --- bot detail buttons ------------------------------------------------
@@ -2208,7 +2657,10 @@ async def show_menu_by_name(update: Update, d: dict, name: str) -> None:
     """Render whichever screen `name` refers to (works for both static menus
     and the dynamic ones that need fresh data each time)."""
     if name == "bots":
-        await show(update, "🤖 إدارة البوتات — اختر بوتاً، أو ارفع بوتاً جديداً:", bots_list_menu())
+        await show(update, "🤖 إدارة البوتات — اختر إجراء:", bots_main_menu())
+        return
+    if name == "my_bots":
+        await show(update, "🤖 بوتاتي — اختر بوتاً للإدارة:", my_bots_menu())
         return
     if name == "bot_detail" and d.get("bot_selected"):
         await refresh_bot_detail_message(update, d["bot_selected"])
@@ -2230,6 +2682,8 @@ async def handle_back(update: Update, d: dict) -> None:
     reset_pending(d)
     if d["mode"] == "terminal":
         await exit_terminal_session(update.effective_user.id)
+    if d["mode"] == "bot_terminal" and d.get("bot_selected"):
+        await exit_bot_terminal(d["bot_selected"])
 
     if d["mode"] == "filemanager" and d["stack"][-1] in ("filemanager",):
         # Step up a directory if not already at the file-manager root.
@@ -2254,10 +2708,14 @@ async def handle_back(update: Update, d: dict) -> None:
         d["mode"] = None
         pop_menu(d)
 
+    if d["mode"] == "bot_terminal":
+        d["mode"] = None
+        pop_menu(d)
+
     if d["stack"][-1] == "bot_detail":
         d["bot_selected"] = None
         d["stack"].pop()
-        await show(update, "🤖 إدارة البوتات — اختر بوتاً، أو ارفع بوتاً جديداً:", bots_list_menu())
+        await show(update, "🤖 بوتاتي — اختر بوتاً للإدارة:", my_bots_menu())
         return
 
     name = pop_menu(d)
@@ -2461,10 +2919,22 @@ async def refresh_bot_detail_message(update: Update, name: str) -> None:
     row = db_get_bot(name)
     if row is None:
         return
-    dot = "🟢 يعمل" if row["status"] == "running" else "🔴 متوقف"
+    
+    status = get_bot_real_status(name)
+    status_icons = {
+        "running": "🟢 يعمل",
+        "starting": "🟡 جاري التشغيل",
+        "stopped": "🔴 متوقف",
+        "crashed": "⚠️ توقف بسبب خطأ",
+    }
+    status_text = status_icons.get(status, "🔴 متوقف")
+    
     text = (
-        f"🤖 {name}\nالحالة: {dot}\nاللغة: {row['runtime']}\n"
-        f"إعادة التشغيل التلقائي: {'مفعلة' if row['auto_restart'] else 'معطلة'}"
+        f"🤖 {name}\n"
+        f"الحالة: {status_text}\n"
+        f"اللغة: {row['runtime']}\n"
+        f"PID: {row['pid'] or 'لا يوجد'}\n"
+        f"إعادة التشغيل التلقائي: {'🟢 مفعلة' if row['auto_restart'] else '🔴 معطلة'}"
     )
     await update.message.reply_text(text, reply_markup=BOT_DETAIL_MENU)
 
@@ -2500,7 +2970,13 @@ async def handle_bot_detail_action(update: Update, context: ContextTypes.DEFAULT
             await update.message.reply_text("(لا يوجد سجل بعد)")
         else:
             content = log_file.read_text(errors="replace")[-config.MAX_OUTPUT_CHARS :]
-            await update.message.reply_text(f"```\n{content}\n```", parse_mode=ParseMode.MARKDOWN)
+            # Check if there's a crash analysis
+            crash_info = await analyze_crash_reason(name)
+            if crash_info.get("diagnosis"):
+                diagnosis = "\n".join(crash_info["diagnosis"])
+                await update.message.reply_text(f"🔍 *تشخيص المشكلة:*\n{diagnosis}\n\n📜 *آخر Logs:*\n```\n{content}\n```", parse_mode=ParseMode.MARKDOWN)
+            else:
+                await update.message.reply_text(f"```\n{content}\n```", parse_mode=ParseMode.MARKDOWN)
         return True
     if text == BOT_ACTION_USAGE:
         row = db_get_bot(name)
@@ -2515,6 +2991,7 @@ async def handle_bot_detail_action(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(
             "✅ تم تفعيل إعادة التشغيل التلقائي." if new_state else "✅ تم تعطيل إعادة التشغيل التلقائي."
         )
+        await refresh_bot_detail_message(update, name)
         return True
     if text == BOT_ACTION_RENAME:
         d["pending"] = "bot_rename"
@@ -2525,11 +3002,11 @@ async def handle_bot_detail_action(update: Update, context: ContextTypes.DEFAULT
         row = db_get_bot(name)
         bot_path = Path(row["path"])
         if (bot_path / ".git").exists():
-            d["pending"] = "bot_confirm_update"
-            d["data"]["bot_update_path"] = str(bot_path)
-            # Check if there are updates
+            await update.message.reply_text("⏳ جاري فحص التحديثات...")
             report, needs_confirm, _ = await perform_git_update(bot_path, allow_stash=False)
             if needs_confirm:
+                d["pending"] = "bot_confirm_update"
+                d["data"]["bot_update_path"] = str(bot_path)
                 await update.message.reply_text(report, reply_markup=CONFIRM_MENU)
                 return True
             elif report.startswith("ℹ️"):
@@ -2537,19 +3014,31 @@ async def handle_bot_detail_action(update: Update, context: ContextTypes.DEFAULT
                 return True
             else:
                 # Actually perform the update
-                report2, _, self_restart = await perform_git_update(bot_path, allow_stash=True)
                 log_action(user_id, f"git update bot {name}: {bot_path}")
+                report2, _, self_restart = await perform_git_update(bot_path, allow_stash=True)
                 await update.message.reply_text(report2)
                 if self_restart:
                     python = sys.executable
                     os.execv(python, [python] + sys.argv)
+                await refresh_bot_detail_message(update, name)
                 return True
         else:
             await update.message.reply_text("ℹ️ هذا البوت ليس مستودع Git. لا يمكن تحديثه عبر GitHub.")
             return True
+    if text == BOT_ACTION_INSTALL_DEP:
+        d["pending"] = "bot_install_dep"
+        await update.message.reply_text("🧩 أرسل اسم المكتبة التي تريد تثبيتها (مثال: telebot):")
+        return True
+    if text == BOT_ACTION_TERMINAL:
+        await enter_bot_terminal(update, d, name)
+        return True
     if text == BOT_ACTION_DELETE:
         d["pending"] = "bot_confirm_delete"
-        await update.message.reply_text(f"هل أنت متأكد من حذف البوت {name} نهائياً؟", reply_markup=CONFIRM_MENU)
+        await update.message.reply_text(
+            f"⚠️ هل أنت متأكد من حذف البوت {name} نهائياً؟\n"
+            f"سيتم حذف جميع ملفات البوت ولا يمكن التراجع.", 
+            reply_markup=CONFIRM_MENU
+        )
         return True
 
     return False
@@ -2585,11 +3074,13 @@ async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, d: 
             await update.message.reply_text("⚠️ يوجد بوت بهذا الاسم بالفعل. أرسل اسماً آخر:")
             return
         reset_pending(d)
-        db_rename_bot(old, new)
-        d["bot_selected"] = new
-        log_action(user_id, f"renamed bot {old} -> {new}")
-        await update.message.reply_text(f"✅ تم تغيير الاسم إلى {new}.")
-        await refresh_bot_detail_message(update, new)
+        if db_rename_bot(old, new):
+            d["bot_selected"] = new
+            log_action(user_id, f"renamed bot {old} -> {new}")
+            await update.message.reply_text(f"✅ تم تغيير الاسم إلى {new}.")
+            await refresh_bot_detail_message(update, new)
+        else:
+            await update.message.reply_text("❌ فشلت إعادة التسمية. الاسم موجود بالفعل.")
         return
 
     if pending == "bot_confirm_delete":
@@ -2597,10 +3088,17 @@ async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, d: 
         if text == CONFIRM_YES:
             name = d["bot_selected"]
             row = db_get_bot(name)
+            # Stop the bot first
             await stop_bot_process(name)
+            # Clean up terminal session if any
+            if name in BOT_TERM_SHELLS:
+                await exit_bot_terminal(name)
             if row:
                 shutil.rmtree(row["path"], ignore_errors=True)
             db_delete_bot(name)
+            # Clean up crash counter
+            if name in _CRASH_COUNTS:
+                del _CRASH_COUNTS[name]
             log_action(user_id, f"delete bot {name}")
             await update.message.reply_text(f"🗑️ تم حذف {name}.")
         else:
@@ -2618,8 +3116,90 @@ async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, d: 
             if self_restart:
                 python = sys.executable
                 os.execv(python, [python] + sys.argv)
+            await refresh_bot_detail_message(update, d["bot_selected"])
         else:
             await update.message.reply_text("تم الإلغاء. لم يتم تغيير أي شيء في المشروع.")
+        return
+
+    if pending == "bot_install_dep":
+        reset_pending(d)
+        dep_name = text.strip()
+        if not dep_name:
+            await update.message.reply_text("❌ الرجاء إدخال اسم مكتبة صحيح.")
+            return
+        
+        bot_name = d["bot_selected"]
+        row = db_get_bot(bot_name)
+        if not row:
+            await update.message.reply_text("❌ البوت غير موجود.")
+            return
+        
+        runtime = row["runtime"]
+        await update.message.reply_text(f"⏳ جاري تثبيت {dep_name} ...")
+        
+        try:
+            if runtime == "python":
+                cmd = [sys.executable, "-m", "pip", "install", "--break-system-packages", dep_name]
+            elif runtime == "node":
+                cmd = ["npm", "install", dep_name]
+            else:
+                await update.message.reply_text(f"❌ لا يدعم {runtime} تثبيت مكتبات بهذه الطريقة.")
+                return
+            
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=row["path"],
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            
+            if proc.returncode == 0:
+                # Update cache if Python
+                if runtime == "python":
+                    # Check if requirements.txt exists and update cache
+                    req_file = Path(row["path"]) / "requirements.txt"
+                    if req_file.exists():
+                        fingerprint = _dependency_fingerprint(Path(row["path"]), "python")
+                        if fingerprint:
+                            cache = _load_dependency_cache()
+                            key = str(Path(row["path"]).resolve()) + ":default"
+                            cache[key] = {"fingerprint": fingerprint, "runtime": "python", "success": True, "updated_at": datetime.now().isoformat(timespec="seconds")}
+                            _save_dependency_cache(cache)
+                
+                await update.message.reply_text(f"✅ تم تثبيت {dep_name} بنجاح.")
+                
+                # Ask if user wants to restart the bot
+                d["pending"] = "bot_install_dep_restart"
+                d["data"]["bot_restart_after_install"] = bot_name
+                await update.message.reply_text(
+                    "🔄 هل تريد إعادة تشغيل البوت الآن لتطبيق التغييرات؟",
+                    reply_markup=kb([[CONFIRM_YES, CONFIRM_NO]])
+                )
+            else:
+                error = (stderr or stdout).decode(errors="replace")[-500:]
+                await update.message.reply_text(
+                    f"❌ فشل تثبيت {dep_name}\n\n"
+                    f"📋 تفاصيل:\n```\n{error}\n```",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        except asyncio.TimeoutError:
+            await update.message.reply_text("⏱️ انتهت المهلة أثناء تثبيت المكتبة.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ: {e}")
+        return
+
+    if pending == "bot_install_dep_restart":
+        reset_pending(d)
+        bot_name = d["data"].get("bot_restart_after_install")
+        if text == CONFIRM_YES and bot_name:
+            await update.message.reply_text("🔄 جاري إعادة تشغيل البوت...")
+            await stop_bot_process(bot_name)
+            await asyncio.sleep(1)
+            msg = await start_bot_process(bot_name)
+            await update.message.reply_text(msg)
+            await refresh_bot_detail_message(update, bot_name)
+        else:
+            await update.message.reply_text("تم الإلغاء. يمكنك إعادة تشغيل البوت لاحقاً.")
         return
 
     if pending == "set_password":
@@ -2818,7 +3398,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         bot_name = safe_child_name(zip_name)
         if not bot_name:
             # Try to use a sanitized version
-            bot_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', zip_name)
+            bot_name = re.sub(r'[^a-zA-Z0-9_\u0621-\u064A\-]', '_', zip_name)
             if not bot_name:
                 bot_name = f"bot_{int(time.time())}"
 
@@ -2869,6 +3449,19 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         runtime, entry = detected
+        
+        # Verify entry point exists
+        entry_path = bot_dir / entry
+        if not entry_path.exists():
+            # Try to detect entry point
+            detected_entry = detect_entry_point(bot_dir, runtime)
+            if detected_entry:
+                entry = detected_entry
+            else:
+                await update.message.reply_text(f"❌ لم يتم العثور على ملف التشغيل للمشروع {runtime}.")
+                shutil.rmtree(bot_dir, ignore_errors=True)
+                return
+
         db_upsert_bot(bot_name, str(bot_dir), runtime, entry)
         log_action(user_id, f"uploaded bot {bot_name} ({runtime}) from ZIP")
 
@@ -2881,7 +3474,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         start_msg = await start_bot_process(bot_name)
         await update.message.reply_text(start_msg)
 
-        await open_bots_menu(update, d)
+        await open_my_bots(update, d)
         return
 
     if pending == "bot_upload_file":
@@ -2890,7 +3483,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         file_name = Path(doc.file_name).stem
         bot_name = safe_child_name(file_name)
         if not bot_name:
-            bot_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', file_name)
+            bot_name = re.sub(r'[^a-zA-Z0-9_\u0621-\u064A\-]', '_', file_name)
             if not bot_name:
                 bot_name = f"bot_{int(time.time())}"
 
@@ -2947,7 +3540,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         start_msg = await start_bot_process(bot_name)
         await update.message.reply_text(start_msg)
 
-        await open_bots_menu(update, d)
+        await open_my_bots(update, d)
         return
 
     await update.message.reply_text("❌ لا يوجد عملية رفع نشطة. الرجاء استخدام الأزرار.")
