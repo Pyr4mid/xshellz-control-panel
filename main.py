@@ -57,6 +57,17 @@ log = logging.getLogger("pyramid")
 # written after a successful dependency check/install.
 DEPENDENCY_CACHE_FILE = Path(config.SERVER_PATH) / ".xshellz_dependency_cache.json"
 
+# Lock for git operations to prevent concurrent updates on same repo
+_GIT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_git_lock(path: str) -> asyncio.Lock:
+    """Get or create a lock for a git repository path."""
+    if path not in _GIT_LOCKS:
+        _GIT_LOCKS[path] = asyncio.Lock()
+    return _GIT_LOCKS[path]
+
+
 def _load_dependency_cache() -> dict:
     try:
         if DEPENDENCY_CACHE_FILE.exists():
@@ -78,8 +89,13 @@ def _save_dependency_cache(data: dict) -> None:
         except Exception:
             pass
 
-def _dependency_fingerprint(path: Path, runtime: str) -> Optional[str]:
-    files = [path / "requirements.txt"] if runtime == "python" else [path / "package.json", path / "package-lock.json"]
+def _dependency_fingerprint(path: Path, runtime: str, requirements_path: Optional[str] = None) -> Optional[str]:
+    if runtime == "python":
+        files = [path / (requirements_path or "requirements.txt")]
+    elif runtime == "node":
+        files = [path / "package.json", path / "package-lock.json"]
+    else:
+        return None
     h = hashlib.sha256()
     found = False
     for fp in files:
@@ -110,7 +126,8 @@ BTN_MONITOR = "📊 مراقبة الموارد"
 BTN_SETTINGS = "⚙️ الإعدادات"
 BTN_GIT_UPDATE = "📦 تحديث المشاريع من GitHub"
 
-BTN_BOT_NEW = "➕ رفع بوت جديد"
+BTN_BOT_NEW_ZIP = "📦 رفع بوت ZIP"
+BTN_BOT_NEW_FILE = "📄 رفع ملف منفرد"
 
 BOT_ACTION_START = "▶ تشغيل"
 BOT_ACTION_STOP = "⏹ إيقاف"
@@ -121,6 +138,7 @@ BOT_ACTION_FILES = "📂 الملفات"
 BOT_ACTION_SETTINGS = "⚙ الإعدادات"
 BOT_ACTION_DELETE = "🗑 حذف"
 BOT_ACTION_RENAME = "✏ إعادة تسمية"
+BOT_ACTION_UPDATE = "📦 تحديث البوت"
 
 CONFIRM_YES = "✅ تأكيد"
 CONFIRM_NO = "❌ إلغاء"
@@ -214,7 +232,7 @@ BOT_DETAIL_MENU = kb(
         [BOT_ACTION_RESTART, BOT_ACTION_LOGS],
         [BOT_ACTION_USAGE, BOT_ACTION_FILES],
         [BOT_ACTION_SETTINGS, BOT_ACTION_RENAME],
-        [BOT_ACTION_DELETE],
+        [BOT_ACTION_UPDATE, BOT_ACTION_DELETE],
     ]
 )
 
@@ -354,6 +372,7 @@ TERM_SHELLS: dict[int, "PersistentShell"] = {}
 
 
 def detect_runtime(path: Path) -> tuple[str, str] | None:
+    # Priority: Python, Node.js, PHP, Java
     for f in path.rglob("*.py"):
         return "python", str(f.relative_to(path))
     for f in path.rglob("*.js"):
@@ -362,6 +381,20 @@ def detect_runtime(path: Path) -> tuple[str, str] | None:
         return "php", str(f.relative_to(path))
     for f in path.rglob("*.jar"):
         return "java", str(f.relative_to(path))
+    return None
+
+
+def detect_runtime_by_file(file_path: Path) -> tuple[str, str] | None:
+    """Detect runtime from a single file."""
+    ext = file_path.suffix.lower()
+    if ext == ".py":
+        return "python", file_path.name
+    elif ext == ".js":
+        return "node", file_path.name
+    elif ext == ".php":
+        return "php", file_path.name
+    elif ext == ".jar":
+        return "java", file_path.name
     return None
 
 
@@ -505,16 +538,18 @@ async def stop_bot_process(name: str) -> str:
         return f"❌ فشل إيقاف {name}: {exc}"
 
 
-async def install_requirements(path: Path, runtime: str, force: bool = False) -> str:
-    fingerprint = _dependency_fingerprint(path, runtime)
+async def install_requirements(path: Path, runtime: str, requirements_path: Optional[str] = None, force: bool = False) -> str:
+    fingerprint = _dependency_fingerprint(path, runtime, requirements_path)
     cache = _load_dependency_cache()
-    key = str(path.resolve())
+    key = str(path.resolve()) + ":" + (requirements_path or "default")
     if fingerprint and not force and cache.get(key, {}).get("fingerprint") == fingerprint and cache.get(key, {}).get("success"):
         return "ℹ️ المتطلبات لم تتغير منذ آخر تثبيت ناجح؛ تم استخدام الـCache ولم تتم إعادة التثبيت."
 
     def _install():
-        if runtime == "python" and (path / "requirements.txt").exists():
-            return subprocess.run([sys.executable, "-m", "pip", "install", "--break-system-packages", "-r", "requirements.txt"], cwd=path, capture_output=True, text=True, timeout=300)
+        if runtime == "python":
+            req_file = path / (requirements_path or "requirements.txt")
+            if req_file.exists():
+                return subprocess.run([sys.executable, "-m", "pip", "install", "--break-system-packages", "-r", str(req_file)], cwd=path, capture_output=True, text=True, timeout=300)
         if runtime == "node" and (path / "package.json").exists():
             cmd = ["npm", "ci"] if (path / "package-lock.json").exists() else ["npm", "install"]
             return subprocess.run(cmd, cwd=path, capture_output=True, text=True, timeout=300)
@@ -640,7 +675,12 @@ def safe_child_name(name: str) -> Optional[str]:
 def safe_extract_zip(zf: zipfile.ZipFile, destination: Path) -> None:
     base = destination.resolve()
     for member in zf.infolist():
-        target = (base / member.filename).resolve()
+        # Normalize the member path
+        member_path = Path(member.filename)
+        # Reject absolute paths and path traversal
+        if member_path.is_absolute() or ".." in member_path.parts:
+            raise ValueError(f"مسار ZIP غير آمن: {member.filename}")
+        target = (base / member_path).resolve()
         if target != base and base not in target.parents:
             raise ValueError(f"مسار ZIP غير آمن: {member.filename}")
     zf.extractall(base)
@@ -726,7 +766,7 @@ def bots_list_menu() -> ReplyKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    rows.append([BTN_BOT_NEW])
+    rows.append([BTN_BOT_NEW_ZIP, BTN_BOT_NEW_FILE])
     return kb(rows)
 
 
@@ -1737,86 +1777,89 @@ async def perform_git_update(path: Path, allow_stash: bool = False) -> tuple[str
     if not (path / ".git").exists():
         return "❌ هذا المجلد ليس مستودع Git.", False, False
 
-    code, fetch_out = await _git_run(["git", "fetch", "--quiet"], path, timeout=90)
-    if code != 0:
-        return f"❌ فشل تحديث المشروع\nتعذر الاتصال بـ GitHub (git fetch):\n{fetch_out.strip()[:300]}", False, False
+    # Use a lock to prevent concurrent updates on the same repo
+    lock = _get_git_lock(str(path.resolve()))
+    async with lock:
+        code, fetch_out = await _git_run(["git", "fetch", "--quiet"], path, timeout=90)
+        if code != 0:
+            return f"❌ فشل تحديث المشروع\nتعذر الاتصال بـ GitHub (git fetch):\n{fetch_out.strip()[:300]}", False, False
 
-    code, branch_out = await _git_run(["git", "rev-parse", "--abbrev-ref", "HEAD"], path, timeout=15)
-    branch = branch_out.strip() or "HEAD"
+        code, branch_out = await _git_run(["git", "rev-parse", "--abbrev-ref", "HEAD"], path, timeout=15)
+        branch = branch_out.strip() or "HEAD"
 
-    code, cmp_out = await _git_run(
-        ["git", "rev-list", "--left-right", "--count", f"HEAD...origin/{branch}"], path, timeout=15
-    )
-    behind = 0
-    if code == 0:
-        parts = cmp_out.strip().split()
-        if len(parts) == 2:
-            behind = int(parts[1])
-
-    if behind == 0:
-        return "ℹ️ المشروع محدث بالفعل، لا توجد تحديثات جديدة على GitHub.", False, False
-
-    code, status_out = await _git_run(["git", "status", "--porcelain"], path, timeout=20)
-    if code != 0:
-        return f"❌ فشل فحص حالة Git:\n{status_out.strip()[:300]}", False, False
-    dirty = bool(status_out.strip())
-
-    if dirty and not allow_stash:
-        return (
-            f"⚠️ يوجد تحديث جديد على GitHub لهذا المشروع، لكن توجد أيضاً تعديلات محلية لم تُحفظ بعد.\n"
-            "لن يتم سحب أي تحديث حتى تؤكد، حتى لا تُفقد تعديلاتك.\n"
-            "عند التأكيد: سيتم حفظ تعديلاتك مؤقتاً (git stash) قبل التحديث، ثم إرجاعها تلقائياً بعده.",
-            True, False,
+        code, cmp_out = await _git_run(
+            ["git", "rev-list", "--left-right", "--count", f"HEAD...origin/{branch}"], path, timeout=15
         )
+        behind = 0
+        if code == 0:
+            parts = cmp_out.strip().split()
+            if len(parts) == 2:
+                behind = int(parts[1])
 
-    report = []
-    stashed = False
-    if dirty and allow_stash:
-        code, stash_out = await _git_run(["git", "stash", "push", "-u", "-m", "xshellz-auto-update"], path, timeout=30)
+        if behind == 0:
+            return "ℹ️ المشروع محدث بالفعل، لا توجد تحديثات جديدة على GitHub.", False, False
+
+        code, status_out = await _git_run(["git", "status", "--porcelain"], path, timeout=20)
         if code != 0:
-            return f"❌ فشل تحديث المشروع\nتعذر حفظ التعديلات المحلية (git stash):\n{stash_out.strip()[:300]}", False, False
-        stashed = True
+            return f"❌ فشل فحص حالة Git:\n{status_out.strip()[:300]}", False, False
+        dirty = bool(status_out.strip())
 
-    old_req_hash = _file_hash(path / "requirements.txt")
-    old_pkg_hash = _file_hash(path / "package.json")
-
-    code, pull_out = await _git_run(["git", "pull", "--ff-only", "origin", branch], path, timeout=120)
-    if code != 0:
-        if stashed:
-            await _git_run(["git", "stash", "pop"], path, timeout=30)
-        return f"❌ فشل تحديث المشروع\nتعذر تنفيذ git pull (قد يحتاج دمجاً يدوياً):\n{pull_out.strip()[:300]}", False, False
-    report.append("✅ تم تحديث Git")
-
-    if stashed:
-        code, pop_out = await _git_run(["git", "stash", "pop"], path, timeout=30)
-        if code != 0:
-            report.append(
-                "⚠️ حدث تعارض عند إرجاع تعديلاتك المحلية بعد التحديث.\n"
-                "تعديلاتك محفوظة بأمان ولم تُحذف — راجعها من التريمنال بأمر: git stash list"
+        if dirty and not allow_stash:
+            return (
+                f"⚠️ يوجد تحديث جديد على GitHub لهذا المشروع، لكن توجد أيضاً تعديلات محلية لم تُحفظ بعد.\n"
+                "لن يتم سحب أي تحديث حتى تؤكد، حتى لا تُفقد تعديلاتك.\n"
+                "عند التأكيد: سيتم حفظ تعديلاتك مؤقتاً (git stash) قبل التحديث، ثم إرجاعها تلقائياً بعده.",
+                True, False,
             )
+
+        report = []
+        stashed = False
+        if dirty and allow_stash:
+            code, stash_out = await _git_run(["git", "stash", "push", "-u", "-m", "xshellz-auto-update"], path, timeout=30)
+            if code != 0:
+                return f"❌ فشل تحديث المشروع\nتعذر حفظ التعديلات المحلية (git stash):\n{stash_out.strip()[:300]}", False, False
+            stashed = True
+
+        old_req_hash = _file_hash(path / "requirements.txt")
+        old_pkg_hash = _file_hash(path / "package.json")
+
+        code, pull_out = await _git_run(["git", "pull", "--ff-only", "origin", branch], path, timeout=120)
+        if code != 0:
+            if stashed:
+                await _git_run(["git", "stash", "pop"], path, timeout=30)
+            return f"❌ فشل تحديث المشروع\nتعذر تنفيذ git pull (قد يحتاج دمجاً يدوياً):\n{pull_out.strip()[:300]}", False, False
+        report.append("✅ تم تحديث Git")
+
+        if stashed:
+            code, pop_out = await _git_run(["git", "stash", "pop"], path, timeout=30)
+            if code != 0:
+                report.append(
+                    "⚠️ حدث تعارض عند إرجاع تعديلاتك المحلية بعد التحديث.\n"
+                    "تعديلاتك محفوظة بأمان ولم تُحذف — راجعها من التريمنال بأمر: git stash list"
+                )
+            else:
+                report.append("✅ تم إرجاع تعديلاتك المحلية بعد التحديث")
+
+        new_req_hash = _file_hash(path / "requirements.txt")
+        new_pkg_hash = _file_hash(path / "package.json")
+
+        if new_req_hash and new_req_hash != old_req_hash:
+            report.append(await install_requirements(path, "python"))
+
+        if new_pkg_hash and new_pkg_hash != old_pkg_hash:
+            report.append(await install_requirements(path, "node"))
+
+        self_restart = False
+        resolved = path.resolve()
+        if resolved == Path(__file__).resolve().parent:
+            report.append("🔁 سيتم إعادة تشغيل لوحة التحكم الآن لتطبيق التحديث...")
+            self_restart = True
         else:
-            report.append("✅ تم إرجاع تعديلاتك المحلية بعد التحديث")
+            note = await _restart_managed_bot_if_any(resolved)
+            if note:
+                report.append(note)
 
-    new_req_hash = _file_hash(path / "requirements.txt")
-    new_pkg_hash = _file_hash(path / "package.json")
-
-    if new_req_hash and new_req_hash != old_req_hash:
-        report.append(await install_requirements(path, "python", force=True))
-
-    if new_pkg_hash and new_pkg_hash != old_pkg_hash:
-        report.append(await install_requirements(path, "node", force=True))
-
-    self_restart = False
-    resolved = path.resolve()
-    if resolved == Path(__file__).resolve().parent:
-        report.append("🔁 سيتم إعادة تشغيل لوحة التحكم الآن لتطبيق التحديث...")
-        self_restart = True
-    else:
-        note = await _restart_managed_bot_if_any(resolved)
-        if note:
-            report.append(note)
-
-    return "✅ تم تحديث المشروع\n" + "\n".join(report), False, self_restart
+        return "✅ تم تحديث المشروع\n" + "\n".join(report), False, self_restart
 
 
 async def render_git_projects(update: Update, d: dict) -> None:
@@ -2073,9 +2116,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if bot_name and d["stack"][-1] == "bots":
         await open_bot_detail(update, d, bot_name)
         return
-    if text == BTN_BOT_NEW:
-        d["pending"] = "bot_upload_name"
-        await update.message.reply_text("أرسل اسماً للبوت الجديد:")
+    if text == BTN_BOT_NEW_ZIP:
+        d["pending"] = "bot_upload_zip"
+        await update.message.reply_text("📦 أرسل ملف ZIP الخاص بالبوت الآن:")
+        return
+    if text == BTN_BOT_NEW_FILE:
+        d["pending"] = "bot_upload_file"
+        await update.message.reply_text("📄 أرسل ملف البوت الآن (Python, PHP, Node.js, أو Java):")
         return
 
     # --- bot detail buttons ------------------------------------------------
@@ -2473,6 +2520,33 @@ async def handle_bot_detail_action(update: Update, context: ContextTypes.DEFAULT
         d["pending"] = "bot_rename"
         await update.message.reply_text("أرسل الاسم الجديد للبوت:")
         return True
+    if text == BOT_ACTION_UPDATE:
+        # Check if this bot is a git repo
+        row = db_get_bot(name)
+        bot_path = Path(row["path"])
+        if (bot_path / ".git").exists():
+            d["pending"] = "bot_confirm_update"
+            d["data"]["bot_update_path"] = str(bot_path)
+            # Check if there are updates
+            report, needs_confirm, _ = await perform_git_update(bot_path, allow_stash=False)
+            if needs_confirm:
+                await update.message.reply_text(report, reply_markup=CONFIRM_MENU)
+                return True
+            elif report.startswith("ℹ️"):
+                await update.message.reply_text(report)
+                return True
+            else:
+                # Actually perform the update
+                report2, _, self_restart = await perform_git_update(bot_path, allow_stash=True)
+                log_action(user_id, f"git update bot {name}: {bot_path}")
+                await update.message.reply_text(report2)
+                if self_restart:
+                    python = sys.executable
+                    os.execv(python, [python] + sys.argv)
+                return True
+        else:
+            await update.message.reply_text("ℹ️ هذا البوت ليس مستودع Git. لا يمكن تحديثه عبر GitHub.")
+            return True
     if text == BOT_ACTION_DELETE:
         d["pending"] = "bot_confirm_delete"
         await update.message.reply_text(f"هل أنت متأكد من حذف البوت {name} نهائياً؟", reply_markup=CONFIRM_MENU)
@@ -2488,17 +2562,17 @@ async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, d: 
     user_id = update.effective_user.id
     pending = d["pending"]
 
-    if pending == "bot_upload_name":
-        name = safe_child_name(text)
-        if not name:
-            await update.message.reply_text("❌ اسم بوت غير صالح. استخدم اسماً بدون / أو \\.")
-            return
-        if db_get_bot(name):
-            await update.message.reply_text("⚠️ يوجد بوت بهذا الاسم بالفعل. اختر اسماً آخر:")
-            return
-        d["data"]["bot_name"] = name
-        d["pending"] = "bot_upload_file"
-        await update.message.reply_text("الآن أرسل ملف ZIP يحتوي على كود البوت:")
+    # --- Bot upload ZIP (handled in on_document) ----------------------------
+    if pending == "bot_upload_zip":
+        # This is handled in on_document, but if user sends text instead
+        reset_pending(d)
+        await update.message.reply_text("⚠️ يرجى إرسال ملف ZIP، وليس نصاً.")
+        return
+
+    if pending == "bot_upload_file":
+        # This is handled in on_document, but if user sends text instead
+        reset_pending(d)
+        await update.message.reply_text("⚠️ يرجى إرسال ملف البوت، وليس نصاً.")
         return
 
     if pending == "bot_rename":
@@ -2532,6 +2606,20 @@ async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, d: 
         else:
             await update.message.reply_text("تم الإلغاء.")
         await return_to_bots_list(update, d)
+        return
+
+    if pending == "bot_confirm_update":
+        reset_pending(d)
+        path = Path(d["data"].get("bot_update_path", ""))
+        if text == CONFIRM_YES:
+            report, _, self_restart = await perform_git_update(path, allow_stash=True)
+            log_action(user_id, f"git update bot: {path}")
+            await update.message.reply_text(report)
+            if self_restart:
+                python = sys.executable
+                os.execv(python, [python] + sys.argv)
+        else:
+            await update.message.reply_text("تم الإلغاء. لم يتم تغيير أي شيء في المشروع.")
         return
 
     if pending == "set_password":
@@ -2723,36 +2811,146 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await render_fm(update, d)
         return
 
-    if pending == "bot_upload_file":
+    if pending == "bot_upload_zip":
         reset_pending(d)
-        name = d["data"]["bot_name"]
-        bot_dir = Path(config.BOTS_DIR) / name
+        # Extract bot name from zip filename
+        zip_name = Path(doc.file_name).stem
+        bot_name = safe_child_name(zip_name)
+        if not bot_name:
+            # Try to use a sanitized version
+            bot_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', zip_name)
+            if not bot_name:
+                bot_name = f"bot_{int(time.time())}"
+
+        bot_dir = Path(config.BOTS_DIR) / bot_name
+        # Check if bot already exists
+        if db_get_bot(bot_name):
+            # Try with a suffix
+            i = 1
+            while db_get_bot(f"{bot_name}_{i}"):
+                i += 1
+            bot_name = f"{bot_name}_{i}"
+            bot_dir = Path(config.BOTS_DIR) / bot_name
+
         bot_dir.mkdir(parents=True, exist_ok=True)
         zip_dest = bot_dir / "upload.zip"
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(str(zip_dest))
+
         try:
             with zipfile.ZipFile(zip_dest) as zf:
+                # Check for path traversal
                 safe_extract_zip(zf, bot_dir)
         except zipfile.BadZipFile:
             await update.message.reply_text("❌ الملف ليس ZIP صالح.")
             shutil.rmtree(bot_dir, ignore_errors=True)
             return
-        zip_dest.unlink(missing_ok=True)
-
-        detected = detect_runtime(bot_dir)
-        if not detected:
-            await update.message.reply_text("❌ لم يتم التعرف على نوع المشروع.")
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
             shutil.rmtree(bot_dir, ignore_errors=True)
             return
+
+        zip_dest.unlink(missing_ok=True)
+
+        # Check if the zip contains a single top-level folder
+        contents = list(bot_dir.iterdir())
+        if len(contents) == 1 and contents[0].is_dir():
+            # Move contents up
+            inner = contents[0]
+            for item in inner.iterdir():
+                shutil.move(str(item), str(bot_dir / item.name))
+            inner.rmdir()
+
+        # Detect runtime
+        detected = detect_runtime(bot_dir)
+        if not detected:
+            await update.message.reply_text("❌ لم يتم التعرف على نوع المشروع في الـZIP.")
+            shutil.rmtree(bot_dir, ignore_errors=True)
+            return
+
         runtime, entry = detected
-        db_upsert_bot(name, str(bot_dir), runtime, entry)
-        log_action(user_id, f"uploaded bot {name} ({runtime})")
-        await update.message.reply_text(f"📦 تم استلام {name} كمشروع {runtime}. جاري تثبيت المتطلبات...")
-        result = install_requirements(bot_dir, runtime)
+        db_upsert_bot(bot_name, str(bot_dir), runtime, entry)
+        log_action(user_id, f"uploaded bot {bot_name} ({runtime}) from ZIP")
+
+        await update.message.reply_text(f"📦 تم استلام {bot_name} كمشروع {runtime}. جاري تثبيت المتطلبات...")
+        result = await install_requirements(bot_dir, runtime)
         await update.message.reply_text(f"✅ تم إعداد البوت.\n```\n{result[-1500:]}\n```", parse_mode=ParseMode.MARKDOWN)
+
+        # Start the bot automatically
+        await update.message.reply_text("🔄 جاري تشغيل البوت...")
+        start_msg = await start_bot_process(bot_name)
+        await update.message.reply_text(start_msg)
+
         await open_bots_menu(update, d)
         return
+
+    if pending == "bot_upload_file":
+        reset_pending(d)
+        # Extract bot name from filename
+        file_name = Path(doc.file_name).stem
+        bot_name = safe_child_name(file_name)
+        if not bot_name:
+            bot_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', file_name)
+            if not bot_name:
+                bot_name = f"bot_{int(time.time())}"
+
+        # Check if bot already exists
+        if db_get_bot(bot_name):
+            i = 1
+            while db_get_bot(f"{bot_name}_{i}"):
+                i += 1
+            bot_name = f"{bot_name}_{i}"
+
+        bot_dir = Path(config.BOTS_DIR) / bot_name
+        bot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Download the file
+        filename = safe_child_name(doc.file_name)
+        if not filename:
+            await update.message.reply_text("❌ اسم الملف غير صالح.")
+            shutil.rmtree(bot_dir, ignore_errors=True)
+            return
+
+        dest = bot_dir / filename
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(str(dest))
+
+        # Detect runtime from the file
+        detected = detect_runtime_by_file(dest)
+        if not detected:
+            await update.message.reply_text(f"❌ لم يتم التعرف على نوع الملف {filename}.")
+            shutil.rmtree(bot_dir, ignore_errors=True)
+            return
+
+        runtime, entry = detected
+        db_upsert_bot(bot_name, str(bot_dir), runtime, entry)
+        log_action(user_id, f"uploaded bot {bot_name} ({runtime}) from file {filename}")
+
+        # Install dependencies if needed
+        if runtime == "python":
+            req_file = bot_dir / "requirements.txt"
+            if not req_file.exists():
+                # Create empty requirements.txt to satisfy install check
+                req_file.touch()
+        elif runtime == "node":
+            pkg_file = bot_dir / "package.json"
+            if not pkg_file.exists():
+                # Create minimal package.json
+                pkg_file.write_text('{"name": "' + bot_name + '", "version": "1.0.0"}')
+
+        await update.message.reply_text(f"📦 تم استلام {bot_name} كمشروع {runtime}. جاري تثبيت المتطلبات...")
+        result = await install_requirements(bot_dir, runtime)
+        await update.message.reply_text(f"✅ تم إعداد البوت.\n```\n{result[-1500:]}\n```", parse_mode=ParseMode.MARKDOWN)
+
+        # Start the bot automatically
+        await update.message.reply_text("🔄 جاري تشغيل البوت...")
+        start_msg = await start_bot_process(bot_name)
+        await update.message.reply_text(start_msg)
+
+        await open_bots_menu(update, d)
+        return
+
+    await update.message.reply_text("❌ لا يوجد عملية رفع نشطة. الرجاء استخدام الأزرار.")
 
 
 # =========================================================================
