@@ -3127,65 +3127,123 @@ async def handle_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, d: 
         if not dep_name:
             await update.message.reply_text("❌ الرجاء إدخال اسم مكتبة صحيح.")
             return
-        
+
         bot_name = d["bot_selected"]
         row = db_get_bot(bot_name)
         if not row:
             await update.message.reply_text("❌ البوت غير موجود.")
             return
-        
+
         runtime = row["runtime"]
-        await update.message.reply_text(f"⏳ جاري تثبيت {dep_name} ...")
-        
+        if runtime not in {"python", "node"}:
+            await update.message.reply_text(
+                f"❌ لا يدعم {runtime} تثبيت مكتبات بهذه الطريقة.\n"
+                "يمكن استخدام 💻 التريمنال لتنفيذ أوامر التثبيت الخاصة بهذه البيئة."
+            )
+            return
+
+        # مؤشر مراحل حقيقي: لا نعرض 100% إلا بعد نجاح أمر التثبيت فعلياً.
+        # النسب هنا مراحل تشغيل وليست نسبة مئوية دقيقة لما تبقى داخل pip/npm.
+        progress = [
+            "*[░░░░░░░░░░] 0%*\n⏳ جاري بدء تثبيت المكتبة...",
+            "*[▓▓░░░░░░░░] 25%*\n📡 جاري تشغيل مدير الحزم...",
+            "*[▓▓▓▓▓░░░░░] 50%*\n📦 جاري تنزيل وتثبيت الحزم...",
+            "*[▓▓▓▓▓▓▓░░░] 75%*\n🧪 جاري التحقق من نتيجة التثبيت...",
+            "*[▓▓▓▓▓▓▓▓▓▓] 100%*\n✅ اكتمل تثبيت المكتبة بنجاح."
+        ]
+
         try:
+            progress_msg = await update.message.reply_text(progress[0], parse_mode=ParseMode.MARKDOWN)
+
             if runtime == "python":
                 cmd = [sys.executable, "-m", "pip", "install", "--break-system-packages", dep_name]
-            elif runtime == "node":
-                cmd = ["npm", "install", dep_name]
             else:
-                await update.message.reply_text(f"❌ لا يدعم {runtime} تثبيت مكتبات بهذه الطريقة.")
-                return
-            
+                cmd = ["npm", "install", dep_name]
+
             proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=row["path"],
+                *cmd,
+                cwd=row["path"],
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-            
+
+            # تحديث واجهة التقدم أثناء العملية بدون تعطيل التثبيت.
+            await asyncio.sleep(0.4)
+            await progress_msg.edit_text(progress[1], parse_mode=ParseMode.MARKDOWN)
+
+            async def read_stream(stream):
+                chunks = []
+                while True:
+                    chunk = await stream.read(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b"".join(chunks)
+
+            stdout_task = asyncio.create_task(read_stream(proc.stdout))
+            stderr_task = asyncio.create_task(read_stream(proc.stderr))
+
+            # 50% تعني أن مدير الحزم بدأ فعلياً في معالجة الحزمة.
+            await asyncio.sleep(0.6)
+            if proc.returncode is None:
+                await progress_msg.edit_text(progress[2], parse_mode=ParseMode.MARKDOWN)
+
+            # انتظر انتهاء العملية مع حد زمني مناسب للمكتبات الكبيرة.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await progress_msg.edit_text(
+                    "❌ فشل تثبيت المكتبة.\n\n⏱️ انتهت مهلة التثبيت بعد 5 دقائق.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+            stdout = await stdout_task
+            stderr = await stderr_task
+
+            await progress_msg.edit_text(progress[3], parse_mode=ParseMode.MARKDOWN)
+            await asyncio.sleep(0.4)
+
             if proc.returncode == 0:
-                # Update cache if Python
+                # Update cache if Python.
                 if runtime == "python":
-                    # Check if requirements.txt exists and update cache
                     req_file = Path(row["path"]) / "requirements.txt"
                     if req_file.exists():
                         fingerprint = _dependency_fingerprint(Path(row["path"]), "python")
                         if fingerprint:
                             cache = _load_dependency_cache()
                             key = str(Path(row["path"]).resolve()) + ":default"
-                            cache[key] = {"fingerprint": fingerprint, "runtime": "python", "success": True, "updated_at": datetime.now().isoformat(timespec="seconds")}
+                            cache[key] = {
+                                "fingerprint": fingerprint,
+                                "runtime": "python",
+                                "success": True,
+                                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                            }
                             _save_dependency_cache(cache)
-                
-                await update.message.reply_text(f"✅ تم تثبيت {dep_name} بنجاح.")
-                
-                # Ask if user wants to restart the bot
+
+                await progress_msg.edit_text(progress[4], parse_mode=ParseMode.MARKDOWN)
+
                 d["pending"] = "bot_install_dep_restart"
                 d["data"]["bot_restart_after_install"] = bot_name
                 await update.message.reply_text(
+                    f"📦 المكتبة: `{dep_name}`\n"
                     "🔄 هل تريد إعادة تشغيل البوت الآن لتطبيق التغييرات؟",
-                    reply_markup=kb([[CONFIRM_YES, CONFIRM_NO]])
+                    reply_markup=kb([[CONFIRM_YES, CONFIRM_NO]]),
+                    parse_mode=ParseMode.MARKDOWN,
                 )
             else:
-                error = (stderr or stdout).decode(errors="replace")[-500:]
-                await update.message.reply_text(
-                    f"❌ فشل تثبيت {dep_name}\n\n"
-                    f"📋 تفاصيل:\n```\n{error}\n```",
-                    parse_mode=ParseMode.MARKDOWN
+                error = (stderr or stdout).decode(errors="replace")[-1200:]
+                await progress_msg.edit_text(
+                    f"❌ فشل تثبيت المكتبة `{dep_name}`.\n\n"
+                    f"📋 الخطأ الحقيقي من مدير الحزم:\n```\n{error or 'لم يتم إرجاع تفاصيل من مدير الحزم.'}\n```",
+                    parse_mode=ParseMode.MARKDOWN,
                 )
-        except asyncio.TimeoutError:
-            await update.message.reply_text("⏱️ انتهت المهلة أثناء تثبيت المكتبة.")
         except Exception as e:
-            await update.message.reply_text(f"❌ خطأ: {e}")
+            await update.message.reply_text(f"❌ حدث خطأ أثناء تثبيت المكتبة: {e}")
         return
 
     if pending == "bot_install_dep_restart":
